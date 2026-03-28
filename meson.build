@@ -172,6 +172,10 @@ dicom_dep = dependency(
   default_options : ['tests=false'],
   version : '>=1.2.0',
 )
+curl_dep = dependency(
+  'libcurl',
+  version : '>=7.50.0',
+)
 
 # Dependency checks
 if jpeg_dep.type_name() != 'internal' and not cc.has_function(

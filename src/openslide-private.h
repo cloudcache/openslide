@@ -215,6 +215,7 @@ int64_t _openslide_ftell(struct _openslide_file *file, GError **err);
 int64_t _openslide_fsize(struct _openslide_file *file, GError **err);
 void _openslide_fclose(struct _openslide_file *file);
 bool _openslide_fexists(const char *path, GError **err);
+const char *_openslide_fget_path(struct _openslide_file *file);
 
 typedef struct _openslide_file _openslide_file;
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(_openslide_file, _openslide_fclose)
