@@ -91,8 +91,8 @@ static GMutex config_mutex;
 static gboolean config_mutex_initialized = FALSE;
 
 static OpenslideHTTPConfig http_config = {
-  .block_size = 1024 * 1024,       /* 1MB blocks like reference impl */
-  .max_cache_blocks = 64,          /* 64MB max cache */
+  .block_size = 512 * 1024,        /* 512KB blocks - balance between request count and data size */
+  .max_cache_blocks = 128,         /* 64MB max cache */
   .retry_max = 3,
   .retry_delay_ms = 100,
   .connect_timeout_ms = 10000,
@@ -140,7 +140,7 @@ typedef struct {
   gint64 last_used;
 } CurlHandle;
 
-#define MAX_CURL_HANDLES 8
+#define MAX_CURL_HANDLES 16
 
 /* Shared connection info - cached in pool, shared by multiple file handles */
 typedef struct _http_connection {
@@ -373,6 +373,14 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
   curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0L);
   curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 0L);
   curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+  
+  /* Try HTTP/2 for multiplexing if available */
+  curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+  
+  /* Enable TCP Fast Open if supported */
+#ifdef CURLOPT_TCP_FASTOPEN
+  curl_easy_setopt(curl, CURLOPT_TCP_FASTOPEN, 1L);
+#endif
   
   /* Set a proper User-Agent - some servers require this */
   curl_easy_setopt(curl, CURLOPT_USERAGENT, "OpenSlide/4.0 libcurl");
