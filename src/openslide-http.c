@@ -122,11 +122,18 @@ typedef enum {
   BLOCK_STATE_READY      /* Data available */
 } BlockState;
 
+/* Intrusive LRU node for O(1) operations */
+typedef struct _lru_node {
+  guint64 block_idx;
+  struct _lru_node *prev;
+  struct _lru_node *next;
+} LruNode;
+
 /* Cache entry with O(1) LRU support */
 typedef struct {
   uint8_t *data;
   size_t len;
-  GList *lru_node;       /* Direct pointer to LRU list node - O(1) promote */
+  LruNode *lru_node;     /* Intrusive O(1) LRU node */
   BlockState state;
   GCond fetch_cond;      /* Condition variable for in-flight waiting */
 } HttpBlock;
@@ -145,7 +152,8 @@ typedef enum {
   CONN_STATE_INIT = 0,
   CONN_STATE_CONNECTING,  /* HEAD request in progress */
   CONN_STATE_READY,       /* Ready for use */
-  CONN_STATE_ERROR
+  CONN_STATE_ERROR,
+  CONN_STATE_CLOSING
 } ConnState;
 
 /* Shared connection info */
@@ -156,7 +164,8 @@ typedef struct _http_connection {
   GCond state_cond;      /* Wait for connection ready */
 
   GHashTable *block_map;  /* block_idx -> HttpBlock* */
-  GList *lru_list;        /* LRU list head (most recent first) */
+  LruNode *lru_head;      /* Most recently used */
+  LruNode *lru_tail;      /* Least recently used */
   guint cache_count;
   GMutex cache_mutex;     /* Separate lock for cache only */
 
@@ -585,39 +594,91 @@ static bool http_fetch_range(HttpConnection *conn,
 }
 
 /* ==============================
- * LRU Cache Management (O(1) operations)
+ * LRU Cache Management (O(1) operations with intrusive linked list)
  * ============================== */
 
-/* O(1) promote - we store direct pointer to GList node */
-static void lru_promote(HttpConnection *conn, HttpBlock *block) {
-  if (!block->lru_node) {
+static void lru_insert_front(HttpConnection *conn, HttpBlock *block, guint64 block_idx) {
+  LruNode *node = g_new0(LruNode, 1);
+  node->block_idx = block_idx;
+  node->next = conn->lru_head;
+  if (conn->lru_head) {
+    conn->lru_head->prev = node;
+  } else {
+    conn->lru_tail = node;
+  }
+  conn->lru_head = node;
+  block->lru_node = node;
+}
+
+static void lru_remove_node(HttpConnection *conn, LruNode *node) {
+  if (!node) {
     return;
   }
-  /* Move node to front - O(1) with GList */
-  conn->lru_list = g_list_remove_link(conn->lru_list, block->lru_node);
-  conn->lru_list = g_list_concat(block->lru_node, conn->lru_list);
+  if (node->prev) {
+    node->prev->next = node->next;
+  } else {
+    conn->lru_head = node->next;
+  }
+  if (node->next) {
+    node->next->prev = node->prev;
+  } else {
+    conn->lru_tail = node->prev;
+  }
+  node->prev = NULL;
+  node->next = NULL;
+}
+
+static void lru_promote(HttpConnection *conn, HttpBlock *block) {
+  LruNode *node = block ? block->lru_node : NULL;
+  if (!node || conn->lru_head == node) {
+    return;
+  }
+  lru_remove_node(conn, node);
+  node->next = conn->lru_head;
+  if (conn->lru_head) {
+    conn->lru_head->prev = node;
+  } else {
+    conn->lru_tail = node;
+  }
+  conn->lru_head = node;
+}
+
+static void http_block_free(HttpBlock *b) {
+  if (!b) {
+    return;
+  }
+  g_free(b->data);
+  b->data = NULL;
+  if (b->lru_node) {
+    g_free(b->lru_node);
+    b->lru_node = NULL;
+  }
+  g_cond_clear(&b->fetch_cond);
+  g_free(b);
+}
+
+static void block_remove_locked(HttpConnection *conn, guint64 block_idx, HttpBlock *b) {
+  if (!b) {
+    return;
+  }
+  if (b->lru_node) {
+    lru_remove_node(conn, b->lru_node);
+  }
+  g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(block_idx));
+  if (conn->cache_count > 0) {
+    conn->cache_count--;
+  }
+  http_block_free(b);
 }
 
 /* O(1) evict from tail */
 static void lru_evict(HttpConnection *conn) {
-  if (!conn->lru_list) {
+  if (!conn->lru_tail) {
     return;
   }
-  GList *last = g_list_last(conn->lru_list);
-  if (!last) {
-    return;
-  }
-  guint64 idx = GPOINTER_TO_UINT(last->data);
+  guint64 idx = conn->lru_tail->block_idx;
   HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
-  if (b) {
-    g_free(b->data);
-    b->data = NULL;
-    g_cond_clear(&b->fetch_cond);
-    g_free(b);
-  }
-  g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(idx));
-  conn->lru_list = g_list_delete_link(conn->lru_list, last);
-  conn->cache_count--;
+  block_remove_locked(conn, idx, b);
 }
 
 /* ==============================
@@ -756,12 +817,43 @@ static bool http_fetch_extent(HttpConnection *conn,
   HTTP_LOG("[HTTP-EXTENT] Fetching blocks %" PRIu64 "-%" PRIu64 " (%zu bytes)\n",
            start_block, end_block, total_len);
   
+  /* Reserve missing blocks up front so parallel readers wait instead of
+   * issuing duplicate single-block fetches. */
+  g_mutex_lock(&conn->cache_mutex);
+  for (guint64 idx = start_block; idx <= end_block; idx++) {
+    HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
+    if (!b) {
+      while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
+        lru_evict(conn);
+      }
+      b = g_new0(HttpBlock, 1);
+      g_cond_init(&b->fetch_cond);
+      lru_insert_front(conn, b, idx);
+      g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(idx), b);
+      conn->cache_count++;
+    }
+    if (b->state != BLOCK_STATE_READY) {
+      b->state = BLOCK_STATE_FETCHING;
+    }
+  }
+  g_mutex_unlock(&conn->cache_mutex);
+
   /* Allocate buffer for entire extent */
   uint8_t *buffer = g_malloc(total_len);
   size_t written = 0;
   
   if (!http_fetch_range(conn, start_offset, total_len, buffer, &written, err)) {
     g_free(buffer);
+    /* Mark reserved blocks as failed and remove them */
+    g_mutex_lock(&conn->cache_mutex);
+    for (guint64 idx = start_block; idx <= end_block; idx++) {
+      HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
+      if (b && b->state == BLOCK_STATE_FETCHING) {
+        g_cond_broadcast(&b->fetch_cond);
+        block_remove_locked(conn, idx, b);
+      }
+    }
+    g_mutex_unlock(&conn->cache_mutex);
     return false;
   }
   
@@ -769,9 +861,9 @@ static bool http_fetch_extent(HttpConnection *conn,
   g_mutex_lock(&conn->cache_mutex);
   
   for (guint64 idx = start_block; idx <= end_block; idx++) {
-    /* Skip if already cached by another thread */
     HttpBlock *existing = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
-    if (existing && existing->state == BLOCK_STATE_READY) {
+    if (existing && existing->state == BLOCK_STATE_READY && existing->data != NULL) {
+      lru_promote(conn, existing);
       continue;
     }
     
@@ -790,25 +882,37 @@ static bool http_fetch_extent(HttpConnection *conn,
     if (!b) {
       b = g_new0(HttpBlock, 1);
       g_cond_init(&b->fetch_cond);
-      b->lru_node = g_list_alloc();
-      b->lru_node->data = GUINT_TO_POINTER(idx);
       
       /* Evict if needed */
       while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
         lru_evict(conn);
       }
       
+      lru_insert_front(conn, b, idx);
       g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(idx), b);
-      conn->lru_list = g_list_concat(b->lru_node, conn->lru_list);
       conn->cache_count++;
     }
     
     /* Copy data to block */
+    g_free(b->data);
     b->data = g_malloc(block_len);
     memcpy(b->data, buffer + block_start, block_len);
     b->len = block_len;
     b->state = BLOCK_STATE_READY;
+    lru_promote(conn, b);
     g_cond_broadcast(&b->fetch_cond);
+  }
+  
+  /* Any reserved blocks not populated by the returned range should be removed. */
+  for (guint64 idx = start_block; idx <= end_block; idx++) {
+    HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
+    if (!b) {
+      continue;
+    }
+    if (b->state == BLOCK_STATE_FETCHING) {
+      g_cond_broadcast(&b->fetch_cond);
+      block_remove_locked(conn, idx, b);
+    }
   }
   
   g_mutex_unlock(&conn->cache_mutex);
@@ -844,10 +948,15 @@ static HttpBlock *http_get_block(HttpConnection *conn,
       }
       if (b->state == BLOCK_STATE_READY) {
         stats_record_cache(TRUE);
+        lru_promote(conn, b);
         g_mutex_unlock(&conn->cache_mutex);
         return b;
       }
-      /* Fetch failed, we'll retry */
+      /* Fetch failed and the entry may already have been removed. */
+      b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(block_idx));
+      if (!b) {
+        /* Fall through and recreate a clean placeholder. */
+      }
     }
   }
 
@@ -857,16 +966,14 @@ static HttpBlock *http_get_block(HttpConnection *conn,
   if (!b) {
     b = g_new0(HttpBlock, 1);
     g_cond_init(&b->fetch_cond);
-    b->lru_node = g_list_alloc();
-    b->lru_node->data = GUINT_TO_POINTER(block_idx);
     
     /* Evict if needed */
     while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
       lru_evict(conn);
     }
     
+    lru_insert_front(conn, b, block_idx);
     g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(block_idx), b);
-    conn->lru_list = g_list_concat(b->lru_node, conn->lru_list);
     conn->cache_count++;
   }
   
@@ -879,8 +986,8 @@ static HttpBlock *http_get_block(HttpConnection *conn,
   
   if (offset >= conn->file_size) {
     g_mutex_lock(&conn->cache_mutex);
-    b->state = BLOCK_STATE_EMPTY;
     g_cond_broadcast(&b->fetch_cond);
+    block_remove_locked(conn, block_idx, b);
     g_mutex_unlock(&conn->cache_mutex);
     return NULL;
   }
@@ -894,17 +1001,22 @@ static HttpBlock *http_get_block(HttpConnection *conn,
   if (!http_fetch_range(conn, offset, len, data, &written, err) || written == 0) {
     g_free(data);
     g_mutex_lock(&conn->cache_mutex);
-    b->state = BLOCK_STATE_EMPTY;
     g_cond_broadcast(&b->fetch_cond);
+    block_remove_locked(conn, block_idx, b);
     g_mutex_unlock(&conn->cache_mutex);
     return NULL;
   }
 
   /* Store data and signal waiters */
   g_mutex_lock(&conn->cache_mutex);
+  /* Free old data if any (shouldn't happen but be safe) */
+  if (b->data) {
+    g_free(b->data);
+  }
   b->data = data;
   b->len = written;
   b->state = BLOCK_STATE_READY;
+  lru_promote(conn, b);
   g_cond_broadcast(&b->fetch_cond);
   g_mutex_unlock(&conn->cache_mutex);
 
@@ -937,21 +1049,13 @@ static void http_connection_destroy(HttpConnection *conn) {
     gpointer key, value;
     g_hash_table_iter_init(&iter, conn->block_map);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
-      HttpBlock *b = value;
-      if (b) {
-        g_free(b->data);
-        b->data = NULL;
-        g_cond_clear(&b->fetch_cond);
-        g_free(b);
-      }
+      http_block_free((HttpBlock *)value);
     }
     g_hash_table_destroy(conn->block_map);
     conn->block_map = NULL;
   }
-  if (conn->lru_list) {
-    g_list_free(conn->lru_list);
-    conn->lru_list = NULL;
-  }
+  conn->lru_head = NULL;
+  conn->lru_tail = NULL;
   g_mutex_unlock(&conn->cache_mutex);
 
   g_free(conn->uri);
@@ -968,32 +1072,39 @@ static void http_connection_unref(HttpConnection *conn) {
     return;
   }
 
+  ensure_pool_mutex_init();
+  g_mutex_lock(&pool_mutex);
   g_mutex_lock(&conn->mutex);
   conn->ref_count--;
   int count = conn->ref_count;
-  g_mutex_unlock(&conn->mutex);
+  if (count > 0) {
+    g_mutex_unlock(&conn->mutex);
+    g_mutex_unlock(&pool_mutex);
+    return;
+  }
 
-  if (count <= 0) {
-#if HTTP_STATS
-    /* Print per-connection stats */
-    gint reqs = g_atomic_int_get(&conn->range_requests);
-    gint bytes_kb = g_atomic_int_get(&conn->range_bytes_kb);
-    gint time_ms = g_atomic_int_get(&conn->range_time_ms);
-    if (reqs > 0) {
-      HTTP_LOG("[HTTP-STATS] %s | requests=%d bytes=%dKB time=%dms avg=%.2fms/req\n",
-               conn->uri, reqs, bytes_kb, time_ms, (double)time_ms / reqs);
-    }
-#endif
-
-    ensure_pool_mutex_init();
-    g_mutex_lock(&pool_mutex);
-    if (conn_pool) {
+  conn->state = CONN_STATE_CLOSING;
+  if (conn_pool) {
+    HttpConnection *pooled = g_hash_table_lookup(conn_pool, conn->uri);
+    if (pooled == conn) {
       g_hash_table_remove(conn_pool, conn->uri);
     }
-    g_mutex_unlock(&pool_mutex);
-
-    http_connection_destroy(conn);
   }
+  g_mutex_unlock(&conn->mutex);
+  g_mutex_unlock(&pool_mutex);
+
+#if HTTP_STATS
+  /* Print per-connection stats */
+  gint reqs = g_atomic_int_get(&conn->range_requests);
+  gint bytes_kb = g_atomic_int_get(&conn->range_bytes_kb);
+  gint time_ms = g_atomic_int_get(&conn->range_time_ms);
+  if (reqs > 0) {
+    HTTP_LOG("[HTTP-STATS] %s | requests=%d bytes=%dKB time=%dms avg=%.2fms/req\n",
+             conn->uri, reqs, bytes_kb, time_ms, (double)time_ms / reqs);
+  }
+#endif
+
+  http_connection_destroy(conn);
 }
 
 /* Header callback to capture Content-Range */
@@ -1032,11 +1143,11 @@ static bool http_get_file_size(const char *uri, uint64_t *out_size, GError **err
   http_curl_setup_common(curl, uri);
   curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
   
-  CURLcode code = curl_easy_perform(curl);
-  long http_code = 0;
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  CURLcode head_code = curl_easy_perform(curl);
+  long head_http_code = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &head_http_code);
   
-  if (code == CURLE_OK && (http_code == 200 || http_code == 206)) {
+  if (head_code == CURLE_OK && (head_http_code == 200 || head_http_code == 206)) {
     double cl = 0;
     curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &cl);
     if (cl > 0) {
@@ -1059,21 +1170,22 @@ static bool http_get_file_size(const char *uri, uint64_t *out_size, GError **err
   curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
   curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hctx);
   
-  code = curl_easy_perform(curl);
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  CURLcode range_code = curl_easy_perform(curl);
+  long range_http_code = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &range_http_code);
   
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
   
-  if (code == CURLE_OK && http_code == 206 && hctx.found) {
+  if (range_code == CURLE_OK && range_http_code == 206 && hctx.found) {
     *out_size = hctx.total_size;
     HTTP_LOG("[HTTP-SIZE] Range fallback success: %s size=%" PRIu64 "\n", uri, *out_size);
     return true;
   }
   
   g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
-              "Failed to get file size for %s (HEAD http=%ld, Range http=%ld)", 
-              uri, http_code, http_code);
+              "Failed to get file size for %s (HEAD curl=%d http=%ld, Range curl=%d http=%ld)", 
+              uri, (int)head_code, head_http_code, (int)range_code, range_http_code);
   return false;
 }
 
@@ -1089,6 +1201,8 @@ static HttpConnection *http_connection_create(const char *uri, GError **err G_GN
   g_cond_init(&conn->state_cond);
   
   conn->block_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+  conn->lru_head = NULL;
+  conn->lru_tail = NULL;
   
   return conn;
 }
@@ -1117,6 +1231,14 @@ static HttpConnection *http_connection_get_or_create(const char *uri, GError **e
       g_mutex_unlock(&conn->mutex);
       g_mutex_unlock(&pool_mutex);
       return conn;
+    }
+    
+    if (conn->state == CONN_STATE_CLOSING) {
+      g_mutex_unlock(&conn->mutex);
+      g_mutex_unlock(&pool_mutex);
+      g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                  "Connection is closing for %s", uri);
+      return NULL;
     }
     
     /* Error state - remove and retry */
