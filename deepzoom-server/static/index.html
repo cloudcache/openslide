@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DeepZoom Viewer - OpenSlide</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/openseadragon.min.js"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        background: '#0a0a0a',
+                        foreground: '#fafafa',
+                        card: '#171717',
+                        'card-foreground': '#fafafa',
+                        border: '#262626',
+                        muted: '#262626',
+                        'muted-foreground': '#a3a3a3',
+                        accent: '#262626',
+                        'accent-foreground': '#fafafa',
+                        primary: '#3b82f6',
+                        'primary-foreground': '#ffffff',
+                        success: '#22c55e',
+                        warning: '#f59e0b',
+                        error: '#ef4444',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        .viewer-container {
+            height: calc(100vh - 140px);
+        }
+        .stats-panel {
+            backdrop-filter: blur(12px);
+            background: rgba(23, 23, 23, 0.9);
+        }
+        .latency-bar {
+            transition: width 0.3s ease;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .animate-pulse-slow {
+            animation: pulse 2s infinite;
+        }
+    </style>
+</head>
+<body class="bg-background text-foreground min-h-screen">
+    <!-- Header -->
+    <header class="border-b border-border px-6 py-3 flex items-center justify-between">
+        <div class="flex items-center gap-4">
+            <h1 class="text-lg font-semibold">DeepZoom Viewer</h1>
+            <span class="text-xs text-muted-foreground px-2 py-1 bg-muted rounded">OpenSlide</span>
+        </div>
+        <div class="flex items-center gap-4">
+            <button id="syncToggle" class="px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded hover:bg-primary/90 transition">
+                Sync: ON
+            </button>
+            <button id="statsToggle" class="px-3 py-1.5 text-sm bg-muted text-foreground rounded hover:bg-accent transition">
+                Stats
+            </button>
+        </div>
+    </header>
+
+    <!-- Path Input Bar -->
+    <div class="border-b border-border px-6 py-3 flex gap-4">
+        <div class="flex-1 flex gap-2">
+            <label class="text-sm text-muted-foreground self-center w-16">Local:</label>
+            <input type="text" id="localPath" placeholder="/path/to/local/slide.svs"
+                class="flex-1 bg-muted border border-border rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary">
+        </div>
+        <div class="flex-1 flex gap-2">
+            <label class="text-sm text-muted-foreground self-center w-16">Remote:</label>
+            <input type="text" id="remotePath" placeholder="https://example.com/slide.svs"
+                class="flex-1 bg-muted border border-border rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary">
+        </div>
+        <button id="loadBtn" class="px-4 py-1.5 bg-primary text-primary-foreground rounded text-sm hover:bg-primary/90 transition">
+            Load
+        </button>
+    </div>
+
+    <!-- Main Viewer Area -->
+    <div class="flex viewer-container">
+        <!-- Left Panel (Local) -->
+        <div class="flex-1 border-r border-border relative">
+            <div class="absolute top-2 left-2 z-10 px-2 py-1 bg-card/80 rounded text-xs flex items-center gap-2">
+                <span class="w-2 h-2 bg-success rounded-full"></span>
+                <span>Local</span>
+            </div>
+            <div id="viewerLocal" class="w-full h-full bg-black"></div>
+        </div>
+        
+        <!-- Right Panel (Remote) -->
+        <div class="flex-1 relative">
+            <div class="absolute top-2 left-2 z-10 px-2 py-1 bg-card/80 rounded text-xs flex items-center gap-2">
+                <span class="w-2 h-2 bg-primary rounded-full"></span>
+                <span>Remote</span>
+            </div>
+            <div id="viewerRemote" class="w-full h-full bg-black"></div>
+        </div>
+    </div>
+
+    <!-- Floating Stats Panel -->
+    <div id="statsPanel" class="fixed bottom-4 right-4 w-96 stats-panel border border-border rounded-lg shadow-xl hidden">
+        <div class="flex items-center justify-between px-4 py-3 border-b border-border cursor-move" id="statsPanelHeader">
+            <h3 class="text-sm font-medium">Performance Monitor</h3>
+            <div class="flex items-center gap-2">
+                <span id="wsStatus" class="w-2 h-2 bg-success rounded-full"></span>
+                <button id="closeStats" class="text-muted-foreground hover:text-foreground">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        
+        <div class="p-4 space-y-4">
+            <!-- Local Stats -->
+            <div class="space-y-2">
+                <div class="flex items-center justify-between text-xs">
+                    <span class="text-muted-foreground flex items-center gap-1">
+                        <span class="w-2 h-2 bg-success rounded-full"></span>
+                        Local
+                    </span>
+                    <span id="localRequests" class="font-mono">0 req</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <div class="flex-1 h-1.5 bg-muted rounded overflow-hidden">
+                        <div id="localLatencyBar" class="latency-bar h-full bg-success" style="width: 0%"></div>
+                    </div>
+                    <span id="localLatency" class="text-xs font-mono w-16 text-right">0ms</span>
+                </div>
+                <div class="flex justify-between text-xs text-muted-foreground">
+                    <span>Avg: <span id="localAvg" class="font-mono">0ms</span></span>
+                    <span>Min: <span id="localMin" class="font-mono">0ms</span></span>
+                    <span>Max: <span id="localMax" class="font-mono">0ms</span></span>
+                </div>
+            </div>
+
+            <!-- Remote Stats -->
+            <div class="space-y-2">
+                <div class="flex items-center justify-between text-xs">
+                    <span class="text-muted-foreground flex items-center gap-1">
+                        <span class="w-2 h-2 bg-primary rounded-full"></span>
+                        Remote
+                    </span>
+                    <span id="remoteRequests" class="font-mono">0 req</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <div class="flex-1 h-1.5 bg-muted rounded overflow-hidden">
+                        <div id="remoteLatencyBar" class="latency-bar h-full bg-primary" style="width: 0%"></div>
+                    </div>
+                    <span id="remoteLatency" class="text-xs font-mono w-16 text-right">0ms</span>
+                </div>
+                <div class="flex justify-between text-xs text-muted-foreground">
+                    <span>Avg: <span id="remoteAvg" class="font-mono">0ms</span></span>
+                    <span>Min: <span id="remoteMin" class="font-mono">0ms</span></span>
+                    <span>Max: <span id="remoteMax" class="font-mono">0ms</span></span>
+                </div>
+            </div>
+
+            <!-- Recent Requests -->
+            <div class="space-y-2">
+                <h4 class="text-xs text-muted-foreground">Recent Requests</h4>
+                <div id="recentRequests" class="space-y-1 max-h-32 overflow-y-auto text-xs font-mono">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
