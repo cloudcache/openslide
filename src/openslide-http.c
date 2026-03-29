@@ -568,12 +568,89 @@ static void lru_evict(HttpConnection *conn) {
  * Block Fetch
  * ============================== */
 
+/* Direct read: fetch directly into user buffer (zero-copy for uncached reads) */
+static bool http_direct_read(HttpConnection *conn,
+                             uint64_t offset, size_t len,
+                             uint8_t *dst, size_t *out_read,
+                             GError **err) {
+  return http_fetch_range(conn, offset, len, dst, out_read, err);
+}
+
+/* Fetch a single block directly into pre-allocated HttpBlock (one less copy) */
+static bool http_fetch_block_direct(HttpConnection *conn,
+                                    guint64 block_idx,
+                                    HttpBlock *block,
+                                    GError **err) {
+  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+  
+  uint64_t offset = block_idx * cfg->block_size;
+  size_t len = cfg->block_size;
+  
+  if (offset >= conn->file_size) {
+    return false;
+  }
+  if (offset + len > conn->file_size) {
+    len = (size_t)(conn->file_size - offset);
+  }
+  
+  /* Pre-allocate block data - CURL will write directly here */
+  block->data = g_malloc(len);
+  block->len = 0;
+  
+  size_t written = 0;
+  if (!http_fetch_range(conn, offset, len, block->data, &written, err)) {
+    g_free(block->data);
+    block->data = NULL;
+    return false;
+  }
+  
+  block->len = written;
+  return true;
+}
+
 /* Fetch multiple consecutive blocks in a single request (like fsspec) */
 static bool http_fetch_blocks_range(HttpConnection *conn,
                                     guint64 start_block, guint64 end_block,
                                     GError **err) {
   const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+  guint64 num_blocks = end_block - start_block + 1;
   
+  /* For single block, use direct fetch (no extra copy) */
+  if (num_blocks == 1) {
+    g_mutex_lock(&conn->mutex);
+    if (g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(start_block))) {
+      g_mutex_unlock(&conn->mutex);
+      return true;  /* Already cached */
+    }
+    
+    /* Evict if needed */
+    while (conn->cache_count >= cfg->max_cache_blocks) {
+      lru_evict(conn);
+    }
+    g_mutex_unlock(&conn->mutex);
+    
+    HttpBlock *b = g_new0(HttpBlock, 1);
+    if (!http_fetch_block_direct(conn, start_block, b, err)) {
+      g_free(b);
+      return false;
+    }
+    
+    g_mutex_lock(&conn->mutex);
+    /* Check again in case another thread added it */
+    HttpBlock *existing = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(start_block));
+    if (existing) {
+      g_free(b->data);
+      g_free(b);
+    } else {
+      g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(start_block), b);
+      conn->lru_list = g_list_prepend(conn->lru_list, GUINT_TO_POINTER(start_block));
+      conn->cache_count++;
+    }
+    g_mutex_unlock(&conn->mutex);
+    return true;
+  }
+  
+  /* Multiple blocks: fetch all at once, then split */
   uint64_t start_offset = start_block * cfg->block_size;
   uint64_t end_offset = (end_block + 1) * cfg->block_size;
   
@@ -603,21 +680,22 @@ static bool http_fetch_blocks_range(HttpConnection *conn,
       continue;
     }
     
-    uint64_t block_start = idx * cfg->block_size - start_offset;
-    uint64_t block_end = (idx + 1) * cfg->block_size - start_offset;
-    if (block_end > written) {
-      block_end = written;
+    /* Calculate offset within the fetched buffer */
+    uint64_t block_start_in_buf = (idx - start_block) * cfg->block_size;
+    uint64_t block_end_in_buf = block_start_in_buf + cfg->block_size;
+    if (block_end_in_buf > written) {
+      block_end_in_buf = written;
     }
-    if (block_start >= written) {
+    if (block_start_in_buf >= written) {
       break;
     }
     
-    size_t block_len = (size_t)(block_end - block_start);
+    size_t block_len = (size_t)(block_end_in_buf - block_start_in_buf);
     
     HttpBlock *b = g_new0(HttpBlock, 1);
     b->data = g_malloc(block_len);
     b->len = block_len;
-    memcpy(b->data, buffer + block_start, block_len);
+    memcpy(b->data, buffer + block_start_in_buf, block_len);
     
     /* Evict if needed */
     while (conn->cache_count >= cfg->max_cache_blocks) {
