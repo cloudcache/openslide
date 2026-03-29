@@ -19,68 +19,79 @@
  *
  */
 
-#pragma once
+#ifndef OPENSLIDE_OPENSLIDE_HTTP_H_
+#define OPENSLIDE_OPENSLIDE_HTTP_H_
 
 #include <glib.h>
 #include <stdbool.h>
 #include <stdint.h>
 
-G_BEGIN_DECLS
-
-/* HTTP backend configuration */
-typedef struct {
-  size_t block_size;           /* block size for caching (default 256KB) */
-  guint max_cache_blocks;      /* max cached blocks per file */
-  int retry_max;               /* max retry attempts */
-  int retry_delay_ms;          /* initial backoff delay in ms */
-  int connect_timeout_ms;      /* connection timeout in ms */
-  int transfer_timeout_ms;     /* transfer timeout in ms */
-  int low_speed_limit;         /* low speed threshold bytes/s */
-  int low_speed_time;          /* low speed detection time in seconds */
-  int pool_ttl_sec;            /* file pool TTL in seconds */
-} OpenslideHTTPConfig;
-
-/* Set global HTTP configuration (call once at startup, thread-safe) */
-void _openslide_http_set_config(const OpenslideHTTPConfig *cfg);
-
-/* Get current HTTP configuration */
-const OpenslideHTTPConfig *_openslide_http_get_config(void);
-
-/* Check if path is a remote URL (http://, https://, s3://) */
-bool _openslide_is_remote_path(const char *path);
-
-/* Initialize HTTP subsystem (called automatically, idempotent) */
-void _openslide_http_init(void);
-
-/* Cleanup HTTP subsystem (call at program exit) */
-void _openslide_http_cleanup(void);
-
 /* Forward declaration - actual struct defined in openslide-http.c */
 struct _openslide_http_file;
+
+/* Configuration structure for HTTP backend */
+typedef struct {
+  uint32_t block_size;        /* Block size for caching (default: 256KB) */
+  uint32_t max_cache_blocks;  /* Max blocks per file (default: 256) */
+  uint32_t retry_max;         /* Max retry count (default: 3) */
+  uint32_t retry_delay_ms;    /* Initial retry delay in ms (default: 200) */
+  uint32_t connect_timeout_ms;/* Connection timeout (default: 5000) */
+  uint32_t transfer_timeout_ms;/* Transfer timeout (default: 15000) */
+  uint32_t low_speed_limit;   /* Low speed threshold bytes/s (default: 10240) */
+  uint32_t low_speed_time;    /* Low speed time in seconds (default: 5) */
+  uint32_t pool_ttl_sec;      /* Pool entry TTL in seconds (default: 300) */
+} OpenslideHTTPConfig;
+
+/*
+ * URL Detection
+ * Returns true if path starts with http://, https://, or s3://
+ */
+bool _openslide_is_remote_path(const char *path);
+
+/*
+ * HTTP Subsystem Initialization and Cleanup
+ * Called automatically on first use, but can be called explicitly
+ */
+void _openslide_http_init(void);
+void _openslide_http_cleanup(void);
+
+/*
+ * Configuration
+ */
+void _openslide_http_set_config(const OpenslideHTTPConfig *cfg);
+const OpenslideHTTPConfig *_openslide_http_get_config(void);
+
+/*
+ * File Operations
+ */
 
 /* Open a remote file handle */
 struct _openslide_http_file *_openslide_http_open(const char *uri,
                                                    GError **err);
 
-/* Read from remote file */
+/* Read from current position, returns bytes read */
 size_t _openslide_http_read(struct _openslide_http_file *file,
                             void *buf, size_t size, GError **err);
 
-/* Read exact bytes from remote file */
+/* Read exact number of bytes, returns false on short read */
 bool _openslide_http_read_exact(struct _openslide_http_file *file,
                                 void *buf, size_t size, GError **err);
 
-/* Seek in remote file */
+/* Seek to position */
 bool _openslide_http_seek(struct _openslide_http_file *file,
                           int64_t offset, int whence, GError **err);
 
-/* Get current position in remote file */
-int64_t _openslide_http_tell(struct _openslide_http_file *file, GError **err);
+/* Get current position */
+int64_t _openslide_http_tell(struct _openslide_http_file *file);
 
-/* Get remote file size */
-int64_t _openslide_http_size(struct _openslide_http_file *file, GError **err);
+/* Get file size */
+uint64_t _openslide_http_size(struct _openslide_http_file *file,
+                              GError **err);
 
-/* Close remote file handle */
+/* Close file handle (decrements refcount, actual cleanup when refcount=0) */
 void _openslide_http_close(struct _openslide_http_file *file);
 
-G_END_DECLS
+/* Get URI string */
+const char *_openslide_http_get_uri(struct _openslide_http_file *file);
+
+#endif /* OPENSLIDE_OPENSLIDE_HTTP_H_ */
