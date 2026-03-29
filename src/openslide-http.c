@@ -32,9 +32,10 @@
 #include <sys/time.h>
 
 /* ==============================
- * Debug Control - set to 0 for production
+ * Debug/Stats Control - set to 0 for production
  * ============================== */
 #define HTTP_DEBUG 0
+#define HTTP_STATS 0
 
 #if HTTP_DEBUG
   #define HTTP_LOG(...) fprintf(stderr, __VA_ARGS__)
@@ -43,25 +44,27 @@
 #endif
 
 /* ==============================
- * Statistics Tracking (atomic counters - no lock needed)
+ * Statistics Tracking (only when HTTP_STATS enabled)
  * ============================== */
 
+#if HTTP_STATS
+
 typedef struct {
-  volatile gint64 total_requests;
-  volatile gint64 total_bytes;
-  volatile gint64 total_time_us;
-  volatile gint64 cache_hits;
-  volatile gint64 cache_misses;
-  volatile gint64 connection_reuses;
-  volatile gint64 new_connections;
+  volatile gint total_requests;
+  volatile gint total_bytes_kb;
+  volatile gint total_time_ms;
+  volatile gint cache_hits;
+  volatile gint cache_misses;
+  volatile gint connection_reuses;
+  volatile gint new_connections;
 } HttpStats;
 
 static HttpStats global_stats = {0};
 
 static inline void stats_record_request(size_t bytes, gint64 time_us, gboolean reused) {
   g_atomic_int_add(&global_stats.total_requests, 1);
-  g_atomic_int_add(&global_stats.total_bytes, (gint)bytes);
-  g_atomic_int_add(&global_stats.total_time_us, (gint)time_us);
+  g_atomic_int_add(&global_stats.total_bytes_kb, (gint)(bytes / 1024));
+  g_atomic_int_add(&global_stats.total_time_ms, (gint)(time_us / 1000));
   if (reused) {
     g_atomic_int_add(&global_stats.connection_reuses, 1);
   } else {
@@ -76,6 +79,11 @@ static inline void stats_record_cache(gboolean hit) {
     g_atomic_int_add(&global_stats.cache_misses, 1);
   }
 }
+
+#else
+  #define stats_record_request(bytes, time_us, reused) ((void)0)
+  #define stats_record_cache(hit) ((void)0)
+#endif
 
 /* ==============================
  * Global Configuration
@@ -159,10 +167,12 @@ typedef struct _http_connection {
   gint ref_count;
   GMutex mutex;           /* Protects ref_count and state */
 
-  /* Per-connection stats (atomic) */
-  volatile gint64 range_requests;
-  volatile gint64 range_bytes;
-  volatile gint64 range_time_us;
+#if HTTP_STATS
+  /* Per-connection stats (atomic, using gint for compatibility) */
+  volatile gint range_requests;
+  volatile gint range_bytes_kb;    /* in KB */
+  volatile gint range_time_ms;     /* in ms */
+#endif
 } HttpConnection;
 
 /* Per-open file handle */
@@ -386,8 +396,15 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
 }
 
 /* ==============================
- * Write Callback
+ * Write Callbacks
  * ============================== */
+
+/* Discard body callback - used when we only need headers */
+static size_t http_discard_callback(void *data G_GNUC_UNUSED, 
+                                    size_t sz, size_t nmemb,
+                                    void *user G_GNUC_UNUSED) {
+  return sz * nmemb;
+}
 
 static size_t http_write_callback(void *data, size_t sz, size_t nmemb,
                                   void *user) {
@@ -462,11 +479,13 @@ static bool http_fetch_range(HttpConnection *conn,
     curl_pool_release(conn, curl);
 
     if (code == CURLE_OK && (http_code == 200 || http_code == 206)) {
+#if HTTP_STATS
       gint64 elapsed = get_time_us() - start_time;
       stats_record_request(ctx.written, elapsed, was_reused);
       g_atomic_int_add(&conn->range_requests, 1);
-      g_atomic_int_add(&conn->range_bytes, (gint)ctx.written);
-      g_atomic_int_add(&conn->range_time_us, (gint)elapsed);
+      g_atomic_int_add(&conn->range_bytes_kb, (gint)(ctx.written / 1024));
+      g_atomic_int_add(&conn->range_time_ms, (gint)(elapsed / 1000));
+#endif
       *out_written = ctx.written;
       return true;
     }
@@ -689,14 +708,16 @@ static void http_connection_unref(HttpConnection *conn) {
   g_mutex_unlock(&conn->mutex);
 
   if (count <= 0) {
+#if HTTP_STATS
     /* Print per-connection stats */
-    gint64 reqs = g_atomic_int_get(&conn->range_requests);
-    gint64 bytes = g_atomic_int_get(&conn->range_bytes);
-    gint64 time_us = g_atomic_int_get(&conn->range_time_us);
+    gint reqs = g_atomic_int_get(&conn->range_requests);
+    gint bytes_kb = g_atomic_int_get(&conn->range_bytes_kb);
+    gint time_ms = g_atomic_int_get(&conn->range_time_ms);
     if (reqs > 0) {
-      HTTP_LOG("[HTTP-STATS] %s | requests=%" PRId64 " bytes=%" PRId64 " time=%" PRId64 "ms avg=%.2fms/req\n",
-               conn->uri, reqs, bytes, time_us / 1000, (double)time_us / reqs / 1000.0);
+      HTTP_LOG("[HTTP-STATS] %s | requests=%d bytes=%dKB time=%dms avg=%.2fms/req\n",
+               conn->uri, reqs, bytes_kb, time_ms, (double)time_ms / reqs);
     }
+#endif
 
     ensure_pool_mutex_init();
     g_mutex_lock(&pool_mutex);
@@ -726,9 +747,7 @@ static bool http_get_file_size(const char *uri, uint64_t *out_size, GError **err
   curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
   
   /* Discard body */
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, 
-                   (size_t (*)(void*, size_t, size_t, void*))
-                   [](void *d, size_t s, size_t n, void *u) { return s*n; });
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_discard_callback);
 
   CURLcode code = curl_easy_perform(curl);
   
@@ -1062,24 +1081,25 @@ bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
  * ============================== */
 
 void _openslide_http_print_stats(void) {
-  gint64 reqs = g_atomic_int_get(&global_stats.total_requests);
-  gint64 bytes = g_atomic_int_get(&global_stats.total_bytes);
-  gint64 time_us = g_atomic_int_get(&global_stats.total_time_us);
-  gint64 hits = g_atomic_int_get(&global_stats.cache_hits);
-  gint64 misses = g_atomic_int_get(&global_stats.cache_misses);
-  gint64 reused = g_atomic_int_get(&global_stats.connection_reuses);
-  gint64 newconn = g_atomic_int_get(&global_stats.new_connections);
+#if HTTP_STATS
+  gint reqs = g_atomic_int_get(&global_stats.total_requests);
+  gint bytes_kb = g_atomic_int_get(&global_stats.total_bytes_kb);
+  gint time_ms = g_atomic_int_get(&global_stats.total_time_ms);
+  gint hits = g_atomic_int_get(&global_stats.cache_hits);
+  gint misses = g_atomic_int_get(&global_stats.cache_misses);
+  gint reused = g_atomic_int_get(&global_stats.connection_reuses);
+  gint newconn = g_atomic_int_get(&global_stats.new_connections);
 
-  fprintf(stderr, "[HTTP-GLOBAL-STATS] requests=%" PRId64 " bytes=%" PRId64 
-          " time=%" PRId64 "ms avg=%.2fms/req\n",
-          reqs, bytes, time_us / 1000, 
-          reqs > 0 ? (double)time_us / reqs / 1000.0 : 0.0);
-  fprintf(stderr, "[HTTP-GLOBAL-STATS] cache_hits=%" PRId64 " cache_misses=%" PRId64 
-          " hit_rate=%.1f%%\n",
+  fprintf(stderr, "[HTTP-GLOBAL-STATS] requests=%d bytes=%dKB time=%dms avg=%.2fms/req\n",
+          reqs, bytes_kb, time_ms, 
+          reqs > 0 ? (double)time_ms / reqs : 0.0);
+  fprintf(stderr, "[HTTP-GLOBAL-STATS] cache_hits=%d cache_misses=%d hit_rate=%.1f%%\n",
           hits, misses, 
           (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0);
-  fprintf(stderr, "[HTTP-GLOBAL-STATS] conn_reused=%" PRId64 " conn_new=%" PRId64 
-          " reuse_rate=%.1f%%\n",
+  fprintf(stderr, "[HTTP-GLOBAL-STATS] conn_reused=%d conn_new=%d reuse_rate=%.1f%%\n",
           reused, newconn,
           (reused + newconn) > 0 ? 100.0 * reused / (reused + newconn) : 0.0);
+#else
+  fprintf(stderr, "[HTTP-GLOBAL-STATS] Statistics disabled (HTTP_STATS=0)\n");
+#endif
 }
