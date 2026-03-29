@@ -90,12 +90,12 @@ static inline void stats_record_cache(gboolean hit) {
  * ============================== */
 
 static OpenslideHTTPConfig http_config = {
-  .block_size = 1024 * 1024,       /* 1MB blocks */
-  .max_cache_blocks = 0,           /* 0 = unlimited */
+  .block_size = 256 * 1024,        /* 256KB blocks - balance latency vs requests */
+  .max_cache_blocks = 0,           /* 0 = unlimited cache */
   .retry_max = 3,
   .retry_delay_ms = 100,
   .connect_timeout_ms = 10000,
-  .transfer_timeout_ms = 60000,
+  .transfer_timeout_ms = 30000,    /* 30s per request */
   .low_speed_limit = 1024,
   .low_speed_time = 30,
   .pool_ttl_sec = 300,
@@ -732,7 +732,7 @@ static bool http_fetch_extent(HttpConnection *conn,
   const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
   
   /* Limit extent size to avoid huge single requests */
-  const guint64 max_extent_blocks = 8;  /* Max 8MB per request */
+  const guint64 max_extent_blocks = 4;  /* Max 1MB per request (4 * 256KB) */
   if (end_block - start_block + 1 > max_extent_blocks) {
     end_block = start_block + max_extent_blocks - 1;
   }
@@ -1164,9 +1164,6 @@ static HttpConnection *http_connection_get_or_create(const char *uri, GError **e
  * Public File API
  * ============================== */
 
-/* Prefetch first N blocks on open - covers TIFF header/directory/tile map */
-#define PREFETCH_BLOCKS_ON_OPEN 4  /* 4MB by default */
-
 struct _openslide_http_file *_openslide_http_open(const char *uri,
                                                    GError **err) {
   HttpConnection *conn = http_connection_get_or_create(uri, err);
@@ -1181,19 +1178,7 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
   file->last_block_idx = G_MAXUINT64;
   file->sequential_hits = 0;
 
-  /* Prefetch metadata blocks - greatly reduces first tile latency */
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
-  guint64 max_prefetch_blocks = (conn->file_size + cfg->block_size - 1) / cfg->block_size;
-  if (max_prefetch_blocks > PREFETCH_BLOCKS_ON_OPEN) {
-    max_prefetch_blocks = PREFETCH_BLOCKS_ON_OPEN;
-  }
-  
-  if (max_prefetch_blocks > 0) {
-    HTTP_LOG("[HTTP-PREFETCH] Prefetching first %" PRIu64 " blocks for %s\n",
-             max_prefetch_blocks, uri);
-    http_fetch_extent(conn, 0, max_prefetch_blocks - 1, NULL);
-  }
-
+  /* Note: No prefetch on open - let reads drive fetching on demand */
   return file;
 }
 
