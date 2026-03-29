@@ -231,7 +231,7 @@ bool _openslide_fseek(struct _openslide_file *file, int64_t offset, int whence,
 
 int64_t _openslide_ftell(struct _openslide_file *file, GError **err) {
   if (file->type == FILE_TYPE_HTTP) {
-    return _openslide_http_tell(file->u.http.handle, err);
+    return _openslide_http_tell(file->u.http.handle);
   }
 
   int64_t ret = ftello(file->u.local.fp);  // ci-allow

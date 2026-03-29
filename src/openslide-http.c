@@ -692,20 +692,19 @@ bool _openslide_http_seek(struct _openslide_http_file *file,
   return true;
 }
 
-int64_t _openslide_http_tell(struct _openslide_http_file *file,
-                             GError **err G_GNUC_UNUSED) {
+int64_t _openslide_http_tell(struct _openslide_http_file *file) {
   if (!file) {
     return -1;
   }
   return file->position;
 }
 
-int64_t _openslide_http_size(struct _openslide_http_file *file,
-                             GError **err G_GNUC_UNUSED) {
+uint64_t _openslide_http_size(struct _openslide_http_file *file,
+                              GError **err G_GNUC_UNUSED) {
   if (!file) {
-    return -1;
+    return 0;
   }
-  return (int64_t)file->conn->file_size;
+  return file->conn->file_size;
 }
 
 void _openslide_http_close(struct _openslide_http_file *file) {
