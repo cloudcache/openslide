@@ -169,6 +169,11 @@ typedef struct _http_connection {
 struct _openslide_http_file {
   HttpConnection *conn;   /* Shared connection (has its own refcount) */
   int64_t position;       /* This handle's read position - NOT shared */
+  
+  /* Read-ahead tracking for sequential access optimization */
+  int64_t last_read_end;  /* End position of last read (for detecting sequential) */
+  guint64 last_block_idx; /* Last accessed block index */
+  guint32 sequential_hits;/* Count of sequential reads */
 };
 
 typedef struct {
@@ -555,6 +560,72 @@ static void lru_evict(HttpConnection *conn) {
  * Block Fetch
  * ============================== */
 
+/* Fetch multiple consecutive blocks in a single request (like fsspec) */
+static bool http_fetch_blocks_range(HttpConnection *conn,
+                                    guint64 start_block, guint64 end_block,
+                                    GError **err) {
+  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+  
+  uint64_t start_offset = start_block * cfg->block_size;
+  uint64_t end_offset = (end_block + 1) * cfg->block_size;
+  
+  if (end_offset > conn->file_size) {
+    end_offset = conn->file_size;
+  }
+  
+  size_t total_len = (size_t)(end_offset - start_offset);
+  if (total_len == 0) {
+    return true;
+  }
+  
+  uint8_t *buffer = g_malloc(total_len);
+  size_t written = 0;
+  
+  if (!http_fetch_range(conn, start_offset, total_len, buffer, &written, err)) {
+    g_free(buffer);
+    return false;
+  }
+  
+  /* Split into individual blocks and cache them */
+  g_mutex_lock(&conn->mutex);
+  
+  for (guint64 idx = start_block; idx <= end_block; idx++) {
+    /* Check if already cached (another thread may have added it) */
+    if (g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx))) {
+      continue;
+    }
+    
+    uint64_t block_start = idx * cfg->block_size - start_offset;
+    uint64_t block_end = (idx + 1) * cfg->block_size - start_offset;
+    if (block_end > written) {
+      block_end = written;
+    }
+    if (block_start >= written) {
+      break;
+    }
+    
+    size_t block_len = (size_t)(block_end - block_start);
+    
+    HttpBlock *b = g_new0(HttpBlock, 1);
+    b->data = g_malloc(block_len);
+    b->len = block_len;
+    memcpy(b->data, buffer + block_start, block_len);
+    
+    /* Evict if needed */
+    while (conn->cache_count >= cfg->max_cache_blocks) {
+      lru_evict(conn);
+    }
+    
+    g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(idx), b);
+    conn->lru_list = g_list_prepend(conn->lru_list, GUINT_TO_POINTER(idx));
+    conn->cache_count++;
+  }
+  
+  g_mutex_unlock(&conn->mutex);
+  g_free(buffer);
+  return true;
+}
+
 static HttpBlock *http_get_block(HttpConnection *conn,
                                  guint64 block_idx, GError **err) {
   const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
@@ -802,6 +873,9 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
   struct _openslide_http_file *file = g_new0(struct _openslide_http_file, 1);
   file->conn = conn;
   file->position = 0;
+  file->last_read_end = -1;
+  file->last_block_idx = G_MAXUINT64;
+  file->sequential_hits = 0;
 
   fprintf(stderr, "[HTTP-OPEN] SUCCESS: %s (size=%" PRIu64 ", handle=%p, pos=0)\n", 
           uri, conn->file_size, (void*)file);
@@ -825,10 +899,52 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
     return 0;
   }
 
+  /* Detect sequential access pattern (like fsspec ReadAheadCache) */
+  gboolean is_sequential = (file->last_read_end >= 0 && pos == file->last_read_end);
+  if (is_sequential) {
+    file->sequential_hits++;
+  } else {
+    file->sequential_hits = 0;
+  }
+
   uint64_t avail = file_size - (uint64_t)pos;
   size_t to_read = MIN(size, (size_t)avail);
   size_t total = 0;
 
+  /* Calculate block range needed */
+  guint64 start_block = (uint64_t)pos / cfg->block_size;
+  guint64 end_block = (uint64_t)(pos + (int64_t)to_read - 1) / cfg->block_size;
+  
+  /* Read-ahead: if sequential pattern detected, prefetch next blocks */
+  guint64 prefetch_blocks = 0;
+  if (file->sequential_hits >= 2) {
+    /* Prefetch up to 4 blocks ahead for sequential reads */
+    prefetch_blocks = MIN(4, (file_size / cfg->block_size) - end_block);
+  }
+
+  /* Check which blocks are missing and need to be fetched */
+  g_mutex_lock(&conn->mutex);
+  guint64 fetch_start = G_MAXUINT64;
+  guint64 fetch_end = 0;
+  
+  for (guint64 idx = start_block; idx <= end_block + prefetch_blocks; idx++) {
+    if (!g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx))) {
+      if (fetch_start == G_MAXUINT64) {
+        fetch_start = idx;
+      }
+      fetch_end = idx;
+    }
+  }
+  g_mutex_unlock(&conn->mutex);
+  
+  /* Batch fetch missing blocks in a single request */
+  if (fetch_start != G_MAXUINT64) {
+    if (!http_fetch_blocks_range(conn, fetch_start, fetch_end, err)) {
+      /* Fall back to individual block fetching on error */
+    }
+  }
+
+  /* Now read from cache */
   while (total < to_read) {
     guint64 block_idx = (uint64_t)(pos + (int64_t)total) / cfg->block_size;
     uint32_t block_off = (uint64_t)(pos + (int64_t)total) % cfg->block_size;
@@ -847,9 +963,12 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
 
     memcpy(dst + total, b->data + block_off, copy_len);
     total += copy_len;
+    
+    file->last_block_idx = block_idx;
   }
 
   file->position += (int64_t)total;
+  file->last_read_end = file->position;
 
   /* Debug first few reads */
   static int dbg_count = 0;
