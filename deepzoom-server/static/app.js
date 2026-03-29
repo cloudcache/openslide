@@ -47,6 +47,17 @@ class ViewerManager {
                 if (e.key === 'Enter') this.loadSlides();
             });
         });
+
+        // Example buttons
+        document.querySelectorAll('.example-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const localPath = btn.dataset.local || '';
+                const remotePath = btn.dataset.remote || '';
+                if (localPath) document.getElementById('localPath').value = localPath;
+                if (remotePath) document.getElementById('remotePath').value = remotePath;
+                this.loadSlides();
+            });
+        });
     }
 
     async loadSlides() {

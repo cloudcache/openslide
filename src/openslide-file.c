@@ -144,11 +144,8 @@ static struct _openslide_file *local_fopen(const char *path, GError **err) {
 struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
   /* Check if this is a remote URL */
   if (_openslide_is_remote_path(path)) {
-    fprintf(stderr, "[OPENSLIDE-HTTP] Opening remote: %s\n", path);
     struct _openslide_http_file *http_handle = _openslide_http_open(path, err);
     if (!http_handle) {
-      fprintf(stderr, "[OPENSLIDE-HTTP] FAILED to open: %s, err=%s\n", 
-              path, err && *err ? (*err)->message : "NULL");
       return NULL;
     }
 
@@ -156,8 +153,6 @@ struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
     file->type = FILE_TYPE_HTTP;
     file->u.http.handle = http_handle;
     file->u.http.uri = g_strdup(path);
-    fprintf(stderr, "[OPENSLIDE-HTTP] SUCCESS opened: %s, size=%ld\n", 
-            path, (long)_openslide_http_size(http_handle, NULL));
     return file;
   }
 
@@ -173,15 +168,7 @@ struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
 size_t _openslide_fread(struct _openslide_file *file, void *buf, size_t size,
                         GError **err) {
   if (file->type == FILE_TYPE_HTTP) {
-    size_t ret = _openslide_http_read(file->u.http.handle, buf, size, err);
-    static int dbg_cnt = 0;
-    if (dbg_cnt < 3 && ret > 0) {
-      dbg_cnt++;
-      unsigned char *p = buf;
-      fprintf(stderr, "[HTTP-READ] %zu bytes, magic: %02x%02x%02x%02x\n",
-              ret, p[0], p[1], p[2], p[3]);
-    }
-    return ret;
+    return _openslide_http_read(file->u.http.handle, buf, size, err);
   }
 
   /* Local file */
