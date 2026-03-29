@@ -283,7 +283,7 @@ static bool http_fetch_range(struct _openslide_http_file *f,
 
   WriteCtx ctx = {.dst = dst, .remain = len, .written = 0};
 
-  for (int retry = 0; retry <= (int)cfg->retry_max; retry++) {
+  for (int retry = 0; retry <= cfg->retry_max; retry++) {
     g_autofree gchar *range = g_strdup_printf(
         "bytes=%" PRIu64 "-%" PRIu64,
         offset + ctx.written,
@@ -317,7 +317,7 @@ static bool http_fetch_range(struct _openslide_http_file *f,
       break;
     }
 
-    if (retry < (int)cfg->retry_max) {
+    if (retry < cfg->retry_max) {
       g_usleep((gulong)cfg->retry_delay_ms * 1000 * (1u << retry));
     }
   }
@@ -460,7 +460,7 @@ static void pool_cleanup_expired(void) {
     struct _openslide_http_file *f = value;
     /* Only expire if ref_count is 1 (only pool holds reference) */
     if (g_atomic_int_get(&f->ref_count) == 1 &&
-        now - f->last_access > (gint64)cfg->pool_ttl_sec) {
+        now - f->last_access > cfg->pool_ttl_sec) {
       g_ptr_array_add(expired, g_strdup(key));
     }
   }
@@ -571,9 +571,12 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
     return NULL;
   }
 
-  curl_off_t cl = -1;
-  curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
-  if (cl <= 0) {
+  /* Use CURLINFO_CONTENT_LENGTH_DOWNLOAD (double) for compatibility with
+     older libcurl versions. CURLINFO_CONTENT_LENGTH_DOWNLOAD_T requires
+     libcurl >= 7.55.0 */
+  double cl_double = -1;
+  curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &cl_double);
+  if (cl_double <= 0) {
     g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                 "Cannot determine file size for %s", uri);
     curl_easy_cleanup(curl);
@@ -585,7 +588,7 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
   f = g_new0(struct _openslide_http_file, 1);
   f->uri = g_strdup(uri);
   f->curl = curl;
-  f->file_size = (uint64_t)cl;
+  f->file_size = (uint64_t)cl_double;
   f->position = 0;
   f->block_map = g_hash_table_new(g_direct_hash, g_direct_equal);
   f->lru_list = NULL;
