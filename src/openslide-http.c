@@ -598,26 +598,39 @@ static void lru_promote(HttpConnection *conn, HttpBlock *block) {
   conn->lru_list = g_list_concat(block->lru_node, conn->lru_list);
 }
 
-/* O(1) evict from tail */
+/* O(1) evict from tail - skip blocks being fetched */
 static void lru_evict(HttpConnection *conn) {
   if (!conn->lru_list) {
     return;
   }
-  GList *last = g_list_last(conn->lru_list);
-  if (!last) {
+  
+  /* Find an evictable block (not FETCHING) */
+  GList *node = g_list_last(conn->lru_list);
+  while (node) {
+    guint64 idx = GPOINTER_TO_UINT(node->data);
+    HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
+    
+    if (b && b->state == BLOCK_STATE_FETCHING) {
+      /* Skip blocks being fetched - try next */
+      node = node->prev;
+      continue;
+    }
+    
+    /* Found evictable block */
+    if (b) {
+      if (b->data) {
+        g_free(b->data);
+        b->data = NULL;
+      }
+      g_cond_clear(&b->fetch_cond);
+      g_free(b);
+    }
+    g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(idx));
+    conn->lru_list = g_list_delete_link(conn->lru_list, node);
+    conn->cache_count--;
     return;
   }
-  guint64 idx = GPOINTER_TO_UINT(last->data);
-  HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
-  if (b) {
-    g_free(b->data);
-    b->data = NULL;
-    g_cond_clear(&b->fetch_cond);
-    g_free(b);
-  }
-  g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(idx));
-  conn->lru_list = g_list_delete_link(conn->lru_list, last);
-  conn->cache_count--;
+  /* No evictable blocks found */
 }
 
 /* ==============================
@@ -801,6 +814,12 @@ static bool http_fetch_extent(HttpConnection *conn,
       g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(idx), b);
       conn->lru_list = g_list_concat(b->lru_node, conn->lru_list);
       conn->cache_count++;
+    } else {
+      /* Free old data if re-populating existing block */
+      if (b->data) {
+        g_free(b->data);
+        b->data = NULL;
+      }
     }
     
     /* Copy data to block */
@@ -902,6 +921,10 @@ static HttpBlock *http_get_block(HttpConnection *conn,
 
   /* Store data and signal waiters */
   g_mutex_lock(&conn->cache_mutex);
+  /* Free old data if any (shouldn't happen but be safe) */
+  if (b->data) {
+    g_free(b->data);
+  }
   b->data = data;
   b->len = written;
   b->state = BLOCK_STATE_READY;
