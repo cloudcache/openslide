@@ -82,12 +82,11 @@ bool _openslide_http_seek(struct _openslide_http_file *file,
                           int64_t offset, int whence, GError **err);
 
 /* Get current position */
-int64_t _openslide_http_tell(struct _openslide_http_file *file,
-                             GError **err);
+int64_t _openslide_http_tell(struct _openslide_http_file *file);
 
 /* Get file size */
-int64_t _openslide_http_size(struct _openslide_http_file *file,
-                             GError **err);
+uint64_t _openslide_http_size(struct _openslide_http_file *file,
+                              GError **err);
 
 /* Close file handle (decrements refcount, actual cleanup when refcount=0) */
 void _openslide_http_close(struct _openslide_http_file *file);
