@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	DefaultTileSize = 254
+	DefaultTileSize = 512  // Larger tiles = fewer HTTP requests, better for object storage
 	DefaultOverlap  = 1
 	DefaultFormat   = "jpeg"
 )

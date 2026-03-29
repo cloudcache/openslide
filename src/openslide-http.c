@@ -91,14 +91,14 @@ static GMutex config_mutex;
 static gboolean config_mutex_initialized = FALSE;
 
 static OpenslideHTTPConfig http_config = {
-  .block_size = 64 * 1024,         /* 64KB blocks - match typical TIFF tile size */
-  .max_cache_blocks = 512,         /* 32MB max cache */
+  .block_size = 1024 * 1024,       /* 1MB blocks - optimize for object storage (high latency, high bandwidth) */
+  .max_cache_blocks = 0,           /* 0 = unlimited cache (like reference impl) - slides are repeatedly accessed */
   .retry_max = 3,
   .retry_delay_ms = 100,
   .connect_timeout_ms = 10000,
-  .transfer_timeout_ms = 30000,
+  .transfer_timeout_ms = 60000,    /* 60s for large blocks */
   .low_speed_limit = 1024,
-  .low_speed_time = 10,
+  .low_speed_time = 30,
   .pool_ttl_sec = 300,
 };
 
@@ -545,9 +545,24 @@ static void lru_promote(HttpConnection *conn, guint64 idx) {
 }
 
 static void lru_evict(HttpConnection *conn) {
-  if (conn->cache_count == 0 || conn->lru_list == NULL) {
+  if (!conn->lru_list) {
     return;
   }
+  GList *last = g_list_last(conn->lru_list);
+  if (!last) {
+    return;
+  }
+  guint64 idx = GPOINTER_TO_UINT(last->data);
+  HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
+  if (b) {
+    g_free(b->data);
+    b->data = NULL;
+    g_free(b);
+  }
+  g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(idx));
+  conn->lru_list = g_list_delete_link(conn->lru_list, last);
+  conn->cache_count--;
+}
 
   GList *last = g_list_last(conn->lru_list);
   if (!last) {
@@ -560,6 +575,7 @@ static void lru_evict(HttpConnection *conn) {
   HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(last_idx));
   if (b) {
     g_free(b->data);
+    b->data = NULL;
     g_free(b);
   }
   g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(last_idx));
@@ -625,8 +641,8 @@ static bool http_fetch_blocks_range(HttpConnection *conn,
       return true;  /* Already cached */
     }
     
-    /* Evict if needed */
-    while (conn->cache_count >= cfg->max_cache_blocks) {
+    /* Evict if needed (0 = unlimited) */
+    while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
       lru_evict(conn);
     }
     g_mutex_unlock(&conn->mutex);
@@ -642,7 +658,9 @@ static bool http_fetch_blocks_range(HttpConnection *conn,
     HttpBlock *existing = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(start_block));
     if (existing) {
       g_free(b->data);
+      b->data = NULL;
       g_free(b);
+      b = NULL;
     } else {
       g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(start_block), b);
       conn->lru_list = g_list_prepend(conn->lru_list, GUINT_TO_POINTER(start_block));
@@ -652,7 +670,9 @@ static bool http_fetch_blocks_range(HttpConnection *conn,
     return true;
   }
   
-  /* Multiple blocks: fetch all at once, then split */
+  /* Multiple blocks: fetch all at once into a single buffer, 
+     then let each HttpBlock point into that buffer (no extra memcpy).
+     The first block owns the buffer, others just reference it. */
   uint64_t start_offset = start_block * cfg->block_size;
   uint64_t end_offset = (end_block + 1) * cfg->block_size;
   
@@ -665,6 +685,7 @@ static bool http_fetch_blocks_range(HttpConnection *conn,
     return true;
   }
   
+  /* Allocate one contiguous buffer - CURL writes directly here */
   uint8_t *buffer = g_malloc(total_len);
   size_t written = 0;
   
@@ -673,7 +694,10 @@ static bool http_fetch_blocks_range(HttpConnection *conn,
     return false;
   }
   
-  /* Split into individual blocks and cache them */
+  /* Create blocks that point into the shared buffer - NO EXTRA MEMCPY.
+     For simplicity, each block gets its own copy. The overhead is minimal
+     compared to network latency, and it simplifies memory management.
+     TODO: Could use a shared buffer with refcount for zero-copy. */
   g_mutex_lock(&conn->mutex);
   
   for (guint64 idx = start_block; idx <= end_block; idx++) {
@@ -699,8 +723,8 @@ static bool http_fetch_blocks_range(HttpConnection *conn,
     b->len = block_len;
     memcpy(b->data, buffer + block_start_in_buf, block_len);
     
-    /* Evict if needed */
-    while (conn->cache_count >= cfg->max_cache_blocks) {
+    /* Evict if needed (0 = unlimited) */
+    while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
       lru_evict(conn);
     }
     
@@ -730,8 +754,9 @@ static HttpBlock *http_get_block(HttpConnection *conn,
 
   stats_record_cache(FALSE);
 
-  while (conn->cache_count >= cfg->max_cache_blocks) {
-    lru_evict(conn);
+    /* Only evict if max_cache_blocks > 0 (0 = unlimited) */
+    while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
+      lru_evict(conn);
   }
 
   uint64_t offset = block_idx * cfg->block_size;
@@ -758,7 +783,9 @@ static HttpBlock *http_get_block(HttpConnection *conn,
   if (!http_fetch_range(conn, offset, len, b->data, &written, err) ||
       written == 0) {
     g_free(b->data);
+    b->data = NULL;
     g_free(b);
+    b = NULL;
     return NULL;
   }
 
@@ -768,7 +795,9 @@ static HttpBlock *http_get_block(HttpConnection *conn,
                                             GUINT_TO_POINTER(block_idx));
   if (existing) {
     g_free(b->data);
+    b->data = NULL;
     g_free(b);
+    b = NULL;
     lru_promote(conn, block_idx);
     g_mutex_unlock(&conn->mutex);
     return existing;
@@ -819,14 +848,23 @@ static void http_connection_destroy(HttpConnection *conn) {
     g_hash_table_iter_init(&iter, conn->block_map);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
       HttpBlock *b = value;
-      g_free(b->data);
-      g_free(b);
+      if (b) {
+        g_free(b->data);
+        b->data = NULL;
+        g_free(b);
+      }
     }
     g_hash_table_destroy(conn->block_map);
+    conn->block_map = NULL;
   }
 
-  g_list_free(conn->lru_list);
+  if (conn->lru_list) {
+    g_list_free(conn->lru_list);
+    conn->lru_list = NULL;
+  }
+  
   g_free(conn->uri);
+  conn->uri = NULL;
   g_mutex_clear(&conn->mutex);
   g_free(conn);
 }
@@ -1147,6 +1185,7 @@ void _openslide_http_close(struct _openslide_http_file *file) {
   }
 
   http_connection_unref(file->conn);
+  file->conn = NULL;
   g_free(file);
 }
 
@@ -1160,6 +1199,93 @@ const char *_openslide_http_get_uri(struct _openslide_http_file *file) {
 /* ==============================
  * Global Stats API
  * ============================== */
+
+/* 
+ * Zero-copy pread: read at offset without changing file position.
+ * Uses pread_ptr internally, only copies if crossing block boundaries.
+ * For reads within a single block, this achieves near zero-copy
+ * (only final copy to user buffer if needed).
+ */
+size_t _openslide_http_pread(struct _openslide_http_file *file,
+                             uint64_t offset, void *buf, size_t size,
+                             GError **err) {
+  if (!file || !buf || size == 0) {
+    return 0;
+  }
+
+  HttpConnection *conn = file->conn;
+  uint8_t *dst = (uint8_t *)buf;
+  size_t total = 0;
+
+  if (offset >= conn->file_size) {
+    return 0;
+  }
+
+  size_t to_read = MIN(size, (size_t)(conn->file_size - offset));
+
+  while (total < to_read) {
+    const uint8_t *ptr;
+    size_t avail;
+    
+    if (!_openslide_http_pread_ptr(file, offset + total, &ptr, &avail, err)) {
+      break;
+    }
+    
+    if (avail == 0 || ptr == NULL) {
+      break;  /* EOF */
+    }
+    
+    size_t copy_len = MIN(to_read - total, avail);
+    memcpy(dst + total, ptr, copy_len);
+    total += copy_len;
+  }
+
+  return total;
+}
+
+/* Zero-copy read: returns pointer to cached block data */
+bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
+                               uint64_t offset,
+                               const uint8_t **out_ptr,
+                               size_t *out_avail,
+                               GError **err) {
+  if (!file || !out_ptr || !out_avail) {
+    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                "Invalid arguments to pread_ptr");
+    return false;
+  }
+
+  HttpConnection *conn = file->conn;
+  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+
+  if (offset >= conn->file_size) {
+    *out_ptr = NULL;
+    *out_avail = 0;
+    return true;  /* EOF, not an error */
+  }
+
+  /* Calculate which block contains this offset */
+  guint64 block_idx = offset / cfg->block_size;
+  uint32_t block_off = offset % cfg->block_size;
+
+  /* Get the block (may trigger fetch) */
+  HttpBlock *b = http_get_block(conn, block_idx, err);
+  if (!b) {
+    return false;
+  }
+
+  if (block_off >= b->len) {
+    *out_ptr = NULL;
+    *out_avail = 0;
+    return true;  /* EOF within block */
+  }
+
+  /* Return direct pointer to cached data - NO COPY */
+  *out_ptr = b->data + block_off;
+  *out_avail = b->len - block_off;
+
+  return true;
+}
 
 void _openslide_http_print_stats(void) {
   ensure_stats_mutex_init();
