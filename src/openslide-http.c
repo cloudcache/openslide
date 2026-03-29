@@ -998,6 +998,20 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
   return total;
 }
 
+/* Read exact number of bytes, error if less */
+bool _openslide_http_read_exact(struct _openslide_http_file *file,
+                                void *buf, size_t size, GError **err) {
+  size_t n = _openslide_http_read(file, buf, size, err);
+  if (n < size) {
+    if (err && !*err) {
+      g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                  "Short read: requested %zu bytes, got %zu", size, n);
+    }
+    return false;
+  }
+  return true;
+}
+
 /* Zero-copy pread */
 size_t _openslide_http_pread(struct _openslide_http_file *file,
                              uint64_t offset, void *buf, size_t size,
