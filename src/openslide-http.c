@@ -91,8 +91,8 @@ static GMutex config_mutex;
 static gboolean config_mutex_initialized = FALSE;
 
 static OpenslideHTTPConfig http_config = {
-  .block_size = 512 * 1024,        /* 512KB blocks - balance between request count and data size */
-  .max_cache_blocks = 128,         /* 64MB max cache */
+  .block_size = 64 * 1024,         /* 64KB blocks - match typical TIFF tile size */
+  .max_cache_blocks = 512,         /* 32MB max cache */
   .retry_max = 3,
   .retry_delay_ms = 100,
   .connect_timeout_ms = 10000,
