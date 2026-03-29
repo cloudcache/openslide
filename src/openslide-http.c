@@ -91,14 +91,14 @@ static GMutex config_mutex;
 static gboolean config_mutex_initialized = FALSE;
 
 static OpenslideHTTPConfig http_config = {
-  .block_size = 256 * 1024,
-  .max_cache_blocks = 256,
+  .block_size = 1024 * 1024,       /* 1MB blocks like reference impl */
+  .max_cache_blocks = 64,          /* 64MB max cache */
   .retry_max = 3,
-  .retry_delay_ms = 200,
-  .connect_timeout_ms = 5000,
-  .transfer_timeout_ms = 15000,
-  .low_speed_limit = 10240,
-  .low_speed_time = 5,
+  .retry_delay_ms = 100,
+  .connect_timeout_ms = 10000,
+  .transfer_timeout_ms = 30000,
+  .low_speed_limit = 1024,
+  .low_speed_time = 10,
   .pool_ttl_sec = 300,
 };
 
@@ -790,8 +790,11 @@ static HttpConnection *http_connection_get_or_create(const char *uri,
 
 struct _openslide_http_file *_openslide_http_open(const char *uri,
                                                    GError **err) {
+  fprintf(stderr, "[HTTP-OPEN] Opening: %s\n", uri);
+  
   HttpConnection *conn = http_connection_get_or_create(uri, err);
   if (!conn) {
+    fprintf(stderr, "[HTTP-OPEN] FAILED: %s\n", uri);
     return NULL;
   }
 
@@ -800,6 +803,8 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
   file->conn = conn;
   file->position = 0;
 
+  fprintf(stderr, "[HTTP-OPEN] SUCCESS: %s (size=%" PRIu64 ", handle=%p, pos=0)\n", 
+          uri, conn->file_size, (void*)file);
   return file;
 }
 
@@ -845,6 +850,18 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
   }
 
   file->position += (int64_t)total;
+
+  /* Debug first few reads */
+  static int dbg_count = 0;
+  if (dbg_count < 5 && total > 0) {
+    dbg_count++;
+    uint8_t *p = (uint8_t *)buf;
+    fprintf(stderr, "[HTTP-READ] #%d: pos=%" PRId64 " size=%zu read=%zu magic=%02x%02x%02x%02x newpos=%" PRId64 "\n",
+            dbg_count, pos, size, total, 
+            total >= 4 ? p[0] : 0, total >= 4 ? p[1] : 0,
+            total >= 4 ? p[2] : 0, total >= 4 ? p[3] : 0,
+            file->position);
+  }
 
   return total;
 }
