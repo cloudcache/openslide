@@ -442,13 +442,19 @@ static void async_downloader_init(void) {
     g_mutex_init(&g_downloader.mutex);
     g_downloader.multi_handle = curl_multi_init();
     if (g_downloader.multi_handle) {
-      /* Enable HTTP/2 multiplexing if available */
+      /* Enable HTTP/2 multiplexing if available (libcurl >= 7.43.0) */
 #ifdef CURLMOPT_PIPELINING
+#ifdef CURLPIPE_MULTIPLEX
       curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
 #endif
-      /* Max connections per host */
+#endif
+      /* Max connections per host (libcurl >= 7.30.0) */
+#ifdef CURLMOPT_MAX_HOST_CONNECTIONS
       curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_MAX_HOST_CONNECTIONS, 8L);
+#endif
+#ifdef CURLMOPT_MAX_TOTAL_CONNECTIONS
       curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_MAX_TOTAL_CONNECTIONS, 16L);
+#endif
     }
     g_downloader.initialized = TRUE;
     g_once_init_leave(&init_once, 1);
@@ -503,7 +509,7 @@ static bool http_fetch_range(HttpConnection *conn,
   *out_written = 0;
 
   WriteCtx ctx = {.dst = dst, .remain = len, .written = 0};
-  gint64 start_time = get_time_us();
+  (void)get_time_us();  /* Available for stats when HTTP_STATS enabled */
 
   for (int retry = 0; retry <= (int)cfg->retry_max; retry++) {
     gboolean was_reused = FALSE;
@@ -640,7 +646,8 @@ static size_t parallel_write_callback(void *data, size_t sz, size_t nmemb, void 
   return total;
 }
 
-/* Fetch multiple ranges in parallel using curl_multi */
+/* Fetch multiple ranges in parallel using curl_multi (for future use) */
+G_GNUC_UNUSED
 static bool http_fetch_parallel(HttpConnection *conn,
                                 uint64_t *offsets, size_t *lens,
                                 uint8_t **buffers, size_t count,
@@ -1070,7 +1077,7 @@ static bool http_get_file_size(const char *uri, uint64_t *out_size, GError **err
   return false;
 }
 
-static HttpConnection *http_connection_create(const char *uri, GError **err) {
+static HttpConnection *http_connection_create(const char *uri, GError **err G_GNUC_UNUSED) {
   HttpConnection *conn = g_new0(HttpConnection, 1);
   conn->uri = g_strdup(uri);
   conn->ref_count = 1;
