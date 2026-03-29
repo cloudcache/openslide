@@ -54,6 +54,22 @@ type RecentRequest struct {
 	Timestamp time.Time     `json:"timestamp"`
 }
 
+// wsConn wraps a websocket connection with its own write mutex
+type wsConn struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
+func (w *wsConn) WriteMessage(messageType int, data []byte) error {
+	w.writeMu.Lock()
+	defer w.writeMu.Unlock()
+	return w.conn.WriteMessage(messageType, data)
+}
+
+func (w *wsConn) Close() error {
+	return w.conn.Close()
+}
+
 // Collector collects and aggregates metrics.
 type Collector struct {
 	mu          sync.RWMutex
@@ -63,7 +79,7 @@ type Collector struct {
 	endpoints   map[string]int64
 	recent      []RecentRequest
 	recentMax   int
-	subscribers map[*websocket.Conn]bool
+	subscribers map[*wsConn]bool
 	subMu       sync.RWMutex
 	upgrader    websocket.Upgrader
 }
@@ -71,13 +87,13 @@ type Collector struct {
 // NewCollector creates a new metrics collector.
 func NewCollector() *Collector {
 	return &Collector{
-		startTime: time.Now(),
-		local:     &SourceStats{MinTime: time.Hour},
-		remote:    &SourceStats{MinTime: time.Hour},
-		endpoints: make(map[string]int64),
-		recent:    make([]RecentRequest, 0, 100),
-		recentMax: 100,
-		subscribers: make(map[*websocket.Conn]bool),
+		startTime:   time.Now(),
+		local:       &SourceStats{MinTime: time.Hour},
+		remote:      &SourceStats{MinTime: time.Hour},
+		endpoints:   make(map[string]int64),
+		recent:      make([]RecentRequest, 0, 100),
+		recentMax:   100,
+		subscribers: make(map[*wsConn]bool),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins
@@ -181,11 +197,13 @@ func (c *Collector) GetRecentRequests(limit int) []RecentRequest {
 
 // HandleWebSocket handles WebSocket connections for real-time stats.
 func (c *Collector) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := c.upgrader.Upgrade(w, r, nil)
+	rawConn, err := c.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
+
+	conn := &wsConn{conn: rawConn}
 
 	c.subMu.Lock()
 	c.subscribers[conn] = true
@@ -216,7 +234,7 @@ func (c *Collector) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	for {
-		_, _, err := conn.ReadMessage()
+		_, _, err := rawConn.ReadMessage()
 		if err != nil {
 			break
 		}
@@ -241,8 +259,8 @@ func (c *Collector) broadcastUpdate(req RecentRequest) {
 	}
 
 	for conn := range c.subscribers {
-		go func(c *websocket.Conn) {
-			c.WriteMessage(websocket.TextMessage, data)
+		go func(ws *wsConn) {
+			ws.WriteMessage(websocket.TextMessage, data)
 		}(conn)
 	}
 }
