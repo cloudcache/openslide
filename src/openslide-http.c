@@ -29,6 +29,59 @@
 #include <glib.h>
 #include <inttypes.h>
 #include <string.h>
+#include <sys/time.h>
+
+/* ==============================
+ * Statistics Tracking
+ * ============================== */
+
+typedef struct {
+  gint64 total_requests;
+  gint64 total_bytes;
+  gint64 total_time_us;       /* Microseconds */
+  gint64 cache_hits;
+  gint64 cache_misses;
+  gint64 connection_reuses;
+  gint64 new_connections;
+} HttpStats;
+
+static HttpStats global_stats = {0};
+static GMutex stats_mutex;
+static gboolean stats_mutex_initialized = FALSE;
+
+static void ensure_stats_mutex_init(void) {
+  static gsize init_once = 0;
+  if (g_once_init_enter(&init_once)) {
+    g_mutex_init(&stats_mutex);
+    stats_mutex_initialized = TRUE;
+    g_once_init_leave(&init_once, 1);
+  }
+}
+
+static void stats_record_request(size_t bytes, gint64 time_us, gboolean reused) {
+  ensure_stats_mutex_init();
+  g_mutex_lock(&stats_mutex);
+  global_stats.total_requests++;
+  global_stats.total_bytes += bytes;
+  global_stats.total_time_us += time_us;
+  if (reused) {
+    global_stats.connection_reuses++;
+  } else {
+    global_stats.new_connections++;
+  }
+  g_mutex_unlock(&stats_mutex);
+}
+
+static void stats_record_cache(gboolean hit) {
+  ensure_stats_mutex_init();
+  g_mutex_lock(&stats_mutex);
+  if (hit) {
+    global_stats.cache_hits++;
+  } else {
+    global_stats.cache_misses++;
+  }
+  g_mutex_unlock(&stats_mutex);
+}
 
 /* ==============================
  * Global Configuration (thread-safe)
@@ -38,14 +91,14 @@ static GMutex config_mutex;
 static gboolean config_mutex_initialized = FALSE;
 
 static OpenslideHTTPConfig http_config = {
-  .block_size = 256 * 1024,
-  .max_cache_blocks = 256,
+  .block_size = 1024 * 1024,       /* 1MB blocks like reference impl */
+  .max_cache_blocks = 64,          /* 64MB max cache */
   .retry_max = 3,
-  .retry_delay_ms = 200,
-  .connect_timeout_ms = 5000,
-  .transfer_timeout_ms = 15000,
-  .low_speed_limit = 10240,
-  .low_speed_time = 5,
+  .retry_delay_ms = 100,
+  .connect_timeout_ms = 10000,
+  .transfer_timeout_ms = 30000,
+  .low_speed_limit = 1024,
+  .low_speed_time = 10,
   .pool_ttl_sec = 300,
 };
 
@@ -80,6 +133,15 @@ typedef struct {
   size_t len;
 } HttpBlock;
 
+/* CURL handle pool entry */
+typedef struct {
+  CURL *curl;
+  gboolean in_use;
+  gint64 last_used;
+} CurlHandle;
+
+#define MAX_CURL_HANDLES 8
+
 /* Shared connection info - cached in pool, shared by multiple file handles */
 typedef struct _http_connection {
   gchar *uri;
@@ -89,15 +151,29 @@ typedef struct _http_connection {
   GList *lru_list;        /* LRU list of block indices */
   guint cache_count;
 
+  /* CURL handle pool for connection reuse */
+  CurlHandle curl_pool[MAX_CURL_HANDLES];
+  GMutex curl_mutex;
+
   gint ref_count;         /* Number of file handles using this connection */
   gint64 last_access;
   GMutex mutex;
+
+  /* Per-connection stats */
+  gint64 range_requests;
+  gint64 range_bytes;
+  gint64 range_time_us;
 } HttpConnection;
 
 /* Per-open file handle - each caller gets their own with independent position */
 struct _openslide_http_file {
   HttpConnection *conn;   /* Shared connection (has its own refcount) */
   int64_t position;       /* This handle's read position - NOT shared */
+  
+  /* Read-ahead tracking for sequential access optimization */
+  int64_t last_read_end;  /* End position of last read (for detecting sequential) */
+  guint64 last_block_idx; /* Last accessed block index */
+  guint32 sequential_hits;/* Count of sequential reads */
 };
 
 typedef struct {
@@ -177,6 +253,7 @@ bool _openslide_is_remote_path(const char *path) {
 void _openslide_http_init(void) {
   ensure_pool_mutex_init();
   ensure_curl_locks_init();
+  ensure_stats_mutex_init();
 
   g_mutex_lock(&pool_mutex);
   if (!http_initialized) {
@@ -219,6 +296,65 @@ void _openslide_http_cleanup(void) {
 }
 
 /* ==============================
+ * CURL Handle Pool Management
+ * ============================== */
+
+static CURL *curl_pool_acquire(HttpConnection *conn, gboolean *was_reused) {
+  g_mutex_lock(&conn->curl_mutex);
+
+  *was_reused = FALSE;
+  gint64 now = g_get_monotonic_time();
+
+  /* Try to find an idle handle */
+  for (int i = 0; i < MAX_CURL_HANDLES; i++) {
+    if (conn->curl_pool[i].curl && !conn->curl_pool[i].in_use) {
+      conn->curl_pool[i].in_use = TRUE;
+      conn->curl_pool[i].last_used = now;
+      *was_reused = TRUE;
+      g_mutex_unlock(&conn->curl_mutex);
+      return conn->curl_pool[i].curl;
+    }
+  }
+
+  /* No idle handle, try to create a new one in an empty slot */
+  for (int i = 0; i < MAX_CURL_HANDLES; i++) {
+    if (!conn->curl_pool[i].curl) {
+      CURL *curl = curl_easy_init();
+      if (curl) {
+        conn->curl_pool[i].curl = curl;
+        conn->curl_pool[i].in_use = TRUE;
+        conn->curl_pool[i].last_used = now;
+        g_mutex_unlock(&conn->curl_mutex);
+        return curl;
+      }
+    }
+  }
+
+  g_mutex_unlock(&conn->curl_mutex);
+
+  /* Pool is full and all handles are in use - create a temporary one */
+  return curl_easy_init();
+}
+
+static void curl_pool_release(HttpConnection *conn, CURL *curl) {
+  g_mutex_lock(&conn->curl_mutex);
+
+  for (int i = 0; i < MAX_CURL_HANDLES; i++) {
+    if (conn->curl_pool[i].curl == curl) {
+      conn->curl_pool[i].in_use = FALSE;
+      conn->curl_pool[i].last_used = g_get_monotonic_time();
+      g_mutex_unlock(&conn->curl_mutex);
+      return;
+    }
+  }
+
+  g_mutex_unlock(&conn->curl_mutex);
+
+  /* This was a temporary handle, clean it up */
+  curl_easy_cleanup(curl);
+}
+
+/* ==============================
  * CURL Setup Helper
  * ============================== */
 
@@ -231,7 +367,12 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
   curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-  curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 60L);
+  curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 300L);
+  
+  /* Enable connection reuse */
+  curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0L);
+  curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 0L);
+  curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
   
   /* Set a proper User-Agent - some servers require this */
   curl_easy_setopt(curl, CURLOPT_USERAGENT, "OpenSlide/4.0 libcurl");
@@ -273,8 +414,14 @@ static size_t http_write_callback(void *data, size_t sz, size_t nmemb,
 }
 
 /* ==============================
- * Range Fetch with Retry
+ * Range Fetch with Retry and Stats
  * ============================== */
+
+static gint64 get_time_us(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (gint64)tv.tv_sec * 1000000 + tv.tv_usec;
+}
 
 static bool http_fetch_range(HttpConnection *conn,
                              uint64_t offset, size_t len,
@@ -284,14 +431,19 @@ static bool http_fetch_range(HttpConnection *conn,
   *out_written = 0;
 
   WriteCtx ctx = {.dst = dst, .remain = len, .written = 0};
+  gint64 start_time = get_time_us();
 
   for (int retry = 0; retry <= (int)cfg->retry_max; retry++) {
-    CURL *curl = curl_easy_init();
+    gboolean was_reused = FALSE;
+    CURL *curl = curl_pool_acquire(conn, &was_reused);
     if (!curl) {
       g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
-                  "Failed to create CURL handle");
+                  "Failed to acquire CURL handle");
       return false;
     }
+
+    /* Reset handle for new request but keep connection alive */
+    curl_easy_reset(curl);
 
     char range_header[128];
     snprintf(range_header, sizeof(range_header),
@@ -307,17 +459,43 @@ static bool http_fetch_range(HttpConnection *conn,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
 
+    gint64 req_start = get_time_us();
     CURLcode code = curl_easy_perform(curl);
+    gint64 req_time = get_time_us() - req_start;
 
     long http_code = 0;
+    double total_time = 0, connect_time = 0, namelookup_time = 0;
     if (code == CURLE_OK) {
       curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+      curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total_time);
+      curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connect_time);
+      curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME, &namelookup_time);
     }
 
+    /* Detailed logging */
+    fprintf(stderr, "[HTTP-RANGE] %s | offset=%" PRIu64 " len=%zu | "
+            "reused=%d retry=%d code=%d http=%ld | "
+            "dns=%.1fms conn=%.1fms total=%.1fms written=%zu\n",
+            conn->uri + (strlen(conn->uri) > 60 ? strlen(conn->uri) - 60 : 0),
+            offset, len, was_reused, retry, code, http_code,
+            namelookup_time * 1000, connect_time * 1000, total_time * 1000,
+            ctx.written);
+
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    curl_pool_release(conn, curl);
 
     if (code == CURLE_OK && (http_code == 200 || http_code == 206)) {
+      gint64 elapsed = get_time_us() - start_time;
+      
+      /* Update stats */
+      stats_record_request(ctx.written, elapsed, was_reused);
+      
+      g_mutex_lock(&conn->mutex);
+      conn->range_requests++;
+      conn->range_bytes += ctx.written;
+      conn->range_time_us += elapsed;
+      g_mutex_unlock(&conn->mutex);
+
       *out_written = ctx.written;
       return true;
     }
@@ -382,6 +560,72 @@ static void lru_evict(HttpConnection *conn) {
  * Block Fetch
  * ============================== */
 
+/* Fetch multiple consecutive blocks in a single request (like fsspec) */
+static bool http_fetch_blocks_range(HttpConnection *conn,
+                                    guint64 start_block, guint64 end_block,
+                                    GError **err) {
+  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+  
+  uint64_t start_offset = start_block * cfg->block_size;
+  uint64_t end_offset = (end_block + 1) * cfg->block_size;
+  
+  if (end_offset > conn->file_size) {
+    end_offset = conn->file_size;
+  }
+  
+  size_t total_len = (size_t)(end_offset - start_offset);
+  if (total_len == 0) {
+    return true;
+  }
+  
+  uint8_t *buffer = g_malloc(total_len);
+  size_t written = 0;
+  
+  if (!http_fetch_range(conn, start_offset, total_len, buffer, &written, err)) {
+    g_free(buffer);
+    return false;
+  }
+  
+  /* Split into individual blocks and cache them */
+  g_mutex_lock(&conn->mutex);
+  
+  for (guint64 idx = start_block; idx <= end_block; idx++) {
+    /* Check if already cached (another thread may have added it) */
+    if (g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx))) {
+      continue;
+    }
+    
+    uint64_t block_start = idx * cfg->block_size - start_offset;
+    uint64_t block_end = (idx + 1) * cfg->block_size - start_offset;
+    if (block_end > written) {
+      block_end = written;
+    }
+    if (block_start >= written) {
+      break;
+    }
+    
+    size_t block_len = (size_t)(block_end - block_start);
+    
+    HttpBlock *b = g_new0(HttpBlock, 1);
+    b->data = g_malloc(block_len);
+    b->len = block_len;
+    memcpy(b->data, buffer + block_start, block_len);
+    
+    /* Evict if needed */
+    while (conn->cache_count >= cfg->max_cache_blocks) {
+      lru_evict(conn);
+    }
+    
+    g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(idx), b);
+    conn->lru_list = g_list_prepend(conn->lru_list, GUINT_TO_POINTER(idx));
+    conn->cache_count++;
+  }
+  
+  g_mutex_unlock(&conn->mutex);
+  g_free(buffer);
+  return true;
+}
+
 static HttpBlock *http_get_block(HttpConnection *conn,
                                  guint64 block_idx, GError **err) {
   const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
@@ -391,9 +635,12 @@ static HttpBlock *http_get_block(HttpConnection *conn,
   HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(block_idx));
   if (b) {
     lru_promote(conn, block_idx);
+    stats_record_cache(TRUE);
     g_mutex_unlock(&conn->mutex);
     return b;
   }
+
+  stats_record_cache(FALSE);
 
   while (conn->cache_count >= cfg->max_cache_blocks) {
     lru_evict(conn);
@@ -457,6 +704,27 @@ static void http_connection_destroy(HttpConnection *conn) {
     return;
   }
 
+  /* Print connection stats before cleanup */
+  fprintf(stderr, "[HTTP-STATS] Connection %s | requests=%" PRId64 
+          " bytes=%" PRId64 " time=%" PRId64 "ms avg=%.2fms/req\n",
+          conn->uri,
+          conn->range_requests,
+          conn->range_bytes,
+          conn->range_time_us / 1000,
+          conn->range_requests > 0 ? 
+            (double)conn->range_time_us / conn->range_requests / 1000.0 : 0);
+
+  /* Cleanup CURL handles */
+  g_mutex_lock(&conn->curl_mutex);
+  for (int i = 0; i < MAX_CURL_HANDLES; i++) {
+    if (conn->curl_pool[i].curl) {
+      curl_easy_cleanup(conn->curl_pool[i].curl);
+      conn->curl_pool[i].curl = NULL;
+    }
+  }
+  g_mutex_unlock(&conn->curl_mutex);
+  g_mutex_clear(&conn->curl_mutex);
+
   if (conn->block_map) {
     GHashTableIter iter;
     gpointer key, value;
@@ -504,6 +772,8 @@ static HttpConnection *http_connection_get_or_create(const char *uri,
     g_atomic_int_inc(&conn->ref_count);
     conn->last_access = g_get_monotonic_time() / G_USEC_PER_SEC;
     g_mutex_unlock(&pool_mutex);
+    fprintf(stderr, "[HTTP-POOL] Reusing connection: %s (refs=%d)\n",
+            uri, g_atomic_int_get(&conn->ref_count));
     return conn;
   }
 
@@ -527,7 +797,10 @@ static HttpConnection *http_connection_get_or_create(const char *uri,
     curl_easy_setopt(curl, CURLOPT_SHARE, curl_share);
   }
 
+  gint64 head_start = get_time_us();
   CURLcode code = curl_easy_perform(curl);
+  gint64 head_time = get_time_us() - head_start;
+
   if (code != CURLE_OK) {
     g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                 "HEAD request failed for %s: %s", uri,
@@ -566,9 +839,17 @@ static HttpConnection *http_connection_get_or_create(const char *uri,
   conn->cache_count = 0;
   conn->ref_count = 1;
   conn->last_access = g_get_monotonic_time() / G_USEC_PER_SEC;
+  conn->range_requests = 0;
+  conn->range_bytes = 0;
+  conn->range_time_us = 0;
   g_mutex_init(&conn->mutex);
+  g_mutex_init(&conn->curl_mutex);
+  memset(conn->curl_pool, 0, sizeof(conn->curl_pool));
 
   g_hash_table_insert(conn_pool, g_strdup(uri), conn);
+
+  fprintf(stderr, "[HTTP-POOL] New connection: %s | size=%" PRIu64 " | HEAD took %.1fms\n",
+          uri, conn->file_size, head_time / 1000.0);
 
   g_mutex_unlock(&pool_mutex);
   return conn;
@@ -580,8 +861,11 @@ static HttpConnection *http_connection_get_or_create(const char *uri,
 
 struct _openslide_http_file *_openslide_http_open(const char *uri,
                                                    GError **err) {
+  fprintf(stderr, "[HTTP-OPEN] Opening: %s\n", uri);
+  
   HttpConnection *conn = http_connection_get_or_create(uri, err);
   if (!conn) {
+    fprintf(stderr, "[HTTP-OPEN] FAILED: %s\n", uri);
     return NULL;
   }
 
@@ -589,7 +873,12 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
   struct _openslide_http_file *file = g_new0(struct _openslide_http_file, 1);
   file->conn = conn;
   file->position = 0;
+  file->last_read_end = -1;
+  file->last_block_idx = G_MAXUINT64;
+  file->sequential_hits = 0;
 
+  fprintf(stderr, "[HTTP-OPEN] SUCCESS: %s (size=%" PRIu64 ", handle=%p, pos=0)\n", 
+          uri, conn->file_size, (void*)file);
   return file;
 }
 
@@ -610,10 +899,52 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
     return 0;
   }
 
+  /* Detect sequential access pattern (like fsspec ReadAheadCache) */
+  gboolean is_sequential = (file->last_read_end >= 0 && pos == file->last_read_end);
+  if (is_sequential) {
+    file->sequential_hits++;
+  } else {
+    file->sequential_hits = 0;
+  }
+
   uint64_t avail = file_size - (uint64_t)pos;
   size_t to_read = MIN(size, (size_t)avail);
   size_t total = 0;
 
+  /* Calculate block range needed */
+  guint64 start_block = (uint64_t)pos / cfg->block_size;
+  guint64 end_block = (uint64_t)(pos + (int64_t)to_read - 1) / cfg->block_size;
+  
+  /* Read-ahead: if sequential pattern detected, prefetch next blocks */
+  guint64 prefetch_blocks = 0;
+  if (file->sequential_hits >= 2) {
+    /* Prefetch up to 4 blocks ahead for sequential reads */
+    prefetch_blocks = MIN(4, (file_size / cfg->block_size) - end_block);
+  }
+
+  /* Check which blocks are missing and need to be fetched */
+  g_mutex_lock(&conn->mutex);
+  guint64 fetch_start = G_MAXUINT64;
+  guint64 fetch_end = 0;
+  
+  for (guint64 idx = start_block; idx <= end_block + prefetch_blocks; idx++) {
+    if (!g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx))) {
+      if (fetch_start == G_MAXUINT64) {
+        fetch_start = idx;
+      }
+      fetch_end = idx;
+    }
+  }
+  g_mutex_unlock(&conn->mutex);
+  
+  /* Batch fetch missing blocks in a single request */
+  if (fetch_start != G_MAXUINT64) {
+    if (!http_fetch_blocks_range(conn, fetch_start, fetch_end, err)) {
+      /* Fall back to individual block fetching on error */
+    }
+  }
+
+  /* Now read from cache */
   while (total < to_read) {
     guint64 block_idx = (uint64_t)(pos + (int64_t)total) / cfg->block_size;
     uint32_t block_off = (uint64_t)(pos + (int64_t)total) % cfg->block_size;
@@ -632,9 +963,24 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
 
     memcpy(dst + total, b->data + block_off, copy_len);
     total += copy_len;
+    
+    file->last_block_idx = block_idx;
   }
 
   file->position += (int64_t)total;
+  file->last_read_end = file->position;
+
+  /* Debug first few reads */
+  static int dbg_count = 0;
+  if (dbg_count < 5 && total > 0) {
+    dbg_count++;
+    uint8_t *p = (uint8_t *)buf;
+    fprintf(stderr, "[HTTP-READ] #%d: pos=%" PRId64 " size=%zu read=%zu magic=%02x%02x%02x%02x newpos=%" PRId64 "\n",
+            dbg_count, pos, size, total, 
+            total >= 4 ? p[0] : 0, total >= 4 ? p[1] : 0,
+            total >= 4 ? p[2] : 0, total >= 4 ? p[3] : 0,
+            file->position);
+  }
 
   return total;
 }
@@ -721,4 +1067,36 @@ const char *_openslide_http_get_uri(struct _openslide_http_file *file) {
     return NULL;
   }
   return file->conn->uri;
+}
+
+/* ==============================
+ * Global Stats API
+ * ============================== */
+
+void _openslide_http_print_stats(void) {
+  ensure_stats_mutex_init();
+  g_mutex_lock(&stats_mutex);
+  
+  fprintf(stderr, "\n[HTTP-GLOBAL-STATS]\n");
+  fprintf(stderr, "  Total requests: %" PRId64 "\n", global_stats.total_requests);
+  fprintf(stderr, "  Total bytes: %" PRId64 " (%.2f MB)\n", 
+          global_stats.total_bytes, global_stats.total_bytes / 1048576.0);
+  fprintf(stderr, "  Total time: %" PRId64 " ms\n", global_stats.total_time_us / 1000);
+  fprintf(stderr, "  Avg time/request: %.2f ms\n",
+          global_stats.total_requests > 0 ? 
+            (double)global_stats.total_time_us / global_stats.total_requests / 1000.0 : 0);
+  fprintf(stderr, "  Cache hits: %" PRId64 " (%.1f%%)\n", 
+          global_stats.cache_hits,
+          (global_stats.cache_hits + global_stats.cache_misses) > 0 ?
+            100.0 * global_stats.cache_hits / (global_stats.cache_hits + global_stats.cache_misses) : 0);
+  fprintf(stderr, "  Cache misses: %" PRId64 "\n", global_stats.cache_misses);
+  fprintf(stderr, "  Connection reuses: %" PRId64 " (%.1f%%)\n",
+          global_stats.connection_reuses,
+          (global_stats.connection_reuses + global_stats.new_connections) > 0 ?
+            100.0 * global_stats.connection_reuses / 
+              (global_stats.connection_reuses + global_stats.new_connections) : 0);
+  fprintf(stderr, "  New connections: %" PRId64 "\n", global_stats.new_connections);
+  fprintf(stderr, "\n");
+
+  g_mutex_unlock(&stats_mutex);
 }

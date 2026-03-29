@@ -313,8 +313,17 @@ func (s *Server) handleCrop(c *gin.Context) {
 	c.Data(http.StatusOK, contentType, buf.Bytes())
 }
 
-// handleDZI returns the DZI descriptor.
+// handleDZI returns the DZI descriptor or tile (if path contains _files).
+// OpenSeadragon requests tiles as /dzi/{path}_files/{level}/{col}_{row}.{format}
 func (s *Server) handleDZI(c *gin.Context) {
+	fullPath := c.Param("path")
+	
+	// Check if this is a tile request (path contains _files/)
+	if strings.Contains(fullPath, "_files/") {
+		s.handleTileFromDZI(c, fullPath)
+		return
+	}
+
 	sp, err := s.parsePath(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -323,7 +332,7 @@ func (s *Server) handleDZI(c *gin.Context) {
 
 	entry, err := s.getSlide(sp)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusNotFound, gin.H{"error": "failed to open slide: " + sp.String()})
 		return
 	}
 
@@ -334,6 +343,91 @@ func (s *Server) handleDZI(c *gin.Context) {
 	}
 
 	c.Data(http.StatusOK, "application/xml", dzi)
+}
+
+// handleTileFromDZI handles tile requests that come through /dzi/ path.
+func (s *Server) handleTileFromDZI(c *gin.Context, fullPath string) {
+	start := time.Now()
+	
+	// Parse: /path/to/slide.svs_files/12/3_4.jpeg
+	filesIdx := strings.LastIndex(fullPath, "_files/")
+	if filesIdx == -1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tile path"})
+		return
+	}
+
+	slidePath := fullPath[:filesIdx]
+	tilePart := fullPath[filesIdx+7:] // after "_files/"
+
+	// Parse level/col_row.format
+	parts := strings.Split(tilePart, "/")
+	if len(parts) != 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tile path format"})
+		return
+	}
+
+	level, err := strconv.Atoi(parts[0])
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid level"})
+		return
+	}
+
+	// Parse col_row.format
+	tileFile := parts[1]
+	dotIdx := strings.LastIndex(tileFile, ".")
+	if dotIdx == -1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tile filename"})
+		return
+	}
+
+	coords := tileFile[:dotIdx]
+	coordParts := strings.Split(coords, "_")
+	if len(coordParts) != 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid tile coordinates"})
+		return
+	}
+
+	col, _ := strconv.Atoi(coordParts[0])
+	row, _ := strconv.Atoi(coordParts[1])
+
+	sp, err := pathutil.ParseFromURL(slidePath)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	parseTime := time.Since(start)
+
+	slideStart := time.Now()
+	entry, err := s.getSlide(sp)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "failed to open slide: " + sp.String()})
+		return
+	}
+	slideTime := time.Since(slideStart)
+
+	tileStart := time.Now()
+	tile, err := entry.generator.GetTile(level, col, row)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	tileTime := time.Since(tileStart)
+
+	totalTime := time.Since(start)
+	
+	// Log detailed timing for remote tiles
+	if sp.IsRemote() {
+		log.Printf("[TILE] %s level=%d col=%d row=%d | parse=%v slide=%v tile=%v total=%v",
+			tilePart, level, col, row, parseTime, slideTime, tileTime, totalTime)
+	}
+
+	contentType := "image/jpeg"
+	if s.config.TileFormat == "png" {
+		contentType = "image/png"
+	}
+
+	c.Data(http.StatusOK, contentType, tile)
 }
 
 // handleTile returns a DeepZoom tile.

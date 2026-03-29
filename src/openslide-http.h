@@ -94,4 +94,7 @@ void _openslide_http_close(struct _openslide_http_file *file);
 /* Get URI string */
 const char *_openslide_http_get_uri(struct _openslide_http_file *file);
 
+/* Print global HTTP statistics to stderr */
+void _openslide_http_print_stats(void);
+
 #endif /* OPENSLIDE_OPENSLIDE_HTTP_H_ */

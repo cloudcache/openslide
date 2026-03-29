@@ -75,7 +75,10 @@ class ViewerManager {
     async loadViewer(type, path) {
         const containerId = type === 'local' ? 'viewerLocal' : 'viewerRemote';
         const encodedPath = PathUtil.encode(path);
+        
+        // Fetch DZI first to get dimensions
         const dziUrl = `/dzi/${encodedPath}`;
+        console.log(`[v0] Loading DZI from: ${dziUrl}`);
 
         // Destroy existing viewer
         if (type === 'local' && this.viewerLocal) {
@@ -84,35 +87,87 @@ class ViewerManager {
             this.viewerRemote.destroy();
         }
 
-        const viewer = OpenSeadragon({
-            id: containerId,
-            prefixUrl: 'https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/images/',
-            tileSources: dziUrl,
-            showNavigator: true,
-            navigatorPosition: 'BOTTOM_RIGHT',
-            showNavigationControl: true,
-            navigationControlAnchor: OpenSeadragon.ControlAnchor.TOP_LEFT,
-            animationTime: 0.5,
-            blendTime: 0.1,
-            constrainDuringPan: true,
-            maxZoomPixelRatio: 2,
-            minZoomImageRatio: 0.8,
-            visibilityRatio: 0.5,
-            zoomPerScroll: 1.2,
-            crossOriginPolicy: 'Anonymous',
-        });
+        // Use custom tile source to properly construct tile URLs
+        const tileSource = {
+            type: 'legacy-image-pyramid',
+            getTileUrl: null // will be replaced
+        };
 
-        if (type === 'local') {
-            this.viewerLocal = viewer;
-        } else {
-            this.viewerRemote = viewer;
+        try {
+            // Fetch DZI XML and parse it
+            const response = await fetch(dziUrl);
+            if (!response.ok) {
+                console.error(`[v0] Failed to fetch DZI: ${response.status}`);
+                return;
+            }
+            const dziXml = await response.text();
+            console.log(`[v0] DZI XML: ${dziXml.substring(0, 200)}...`);
+
+            // Parse DZI XML
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(dziXml, 'application/xml');
+            const imageEl = doc.querySelector('Image');
+            const sizeEl = doc.querySelector('Size');
+            
+            if (!imageEl || !sizeEl) {
+                console.error('[v0] Invalid DZI XML');
+                return;
+            }
+
+            const format = imageEl.getAttribute('Format') || 'jpeg';
+            const tileSize = parseInt(imageEl.getAttribute('TileSize')) || 254;
+            const overlap = parseInt(imageEl.getAttribute('Overlap')) || 1;
+            const width = parseInt(sizeEl.getAttribute('Width'));
+            const height = parseInt(sizeEl.getAttribute('Height'));
+
+            console.log(`[v0] DZI: ${width}x${height}, tileSize=${tileSize}, overlap=${overlap}, format=${format}`);
+
+            // Create custom tile source
+            const tilesBaseUrl = `/tiles/${encodedPath}_files`;
+            
+            const viewer = OpenSeadragon({
+                id: containerId,
+                prefixUrl: 'https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/images/',
+                tileSources: {
+                    width: width,
+                    height: height,
+                    tileSize: tileSize,
+                    tileOverlap: overlap,
+                    getTileUrl: function(level, x, y) {
+                        const url = `${tilesBaseUrl}/${level}/${x}_${y}.${format}`;
+                        console.log(`[v0] Tile URL: ${url}`);
+                        return url;
+                    }
+                },
+                showNavigator: true,
+                navigatorPosition: 'BOTTOM_RIGHT',
+                showNavigationControl: true,
+                navigationControlAnchor: OpenSeadragon.ControlAnchor.TOP_LEFT,
+                animationTime: 0.5,
+                blendTime: 0.1,
+                constrainDuringPan: true,
+                maxZoomPixelRatio: 2,
+                minZoomImageRatio: 0.8,
+                visibilityRatio: 0.5,
+                zoomPerScroll: 1.2,
+                crossOriginPolicy: 'Anonymous',
+            });
+
+            if (type === 'local') {
+                this.viewerLocal = viewer;
+            } else {
+                this.viewerRemote = viewer;
+            }
+
+            // Setup sync handlers
+            this.setupSyncHandlers(viewer, type);
+
+            // Fetch and display metadata
+            this.fetchMetadata(encodedPath, type);
+
+        } catch (err) {
+            console.error(`[v0] Error loading viewer:`, err);
         }
-
-        // Setup sync handlers
-        this.setupSyncHandlers(viewer, type);
-
-        // Fetch and display metadata
-        this.fetchMetadata(encodedPath, type);
     }
 
     setupSyncHandlers(viewer, type) {
