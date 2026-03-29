@@ -235,6 +235,12 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
   curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 60L);
+  
+  /* Do NOT set CURLOPT_ACCEPT_ENCODING for Range requests.
+     Setting it to "" causes CURL to send "Accept-Encoding: gzip, deflate",
+     which makes many servers (including GCS) ignore the Range header and
+     return the full compressed content (HTTP 200) instead of partial
+     content (HTTP 206). We need raw bytes for Range requests. */
 
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)cfg->connect_timeout_ms);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)cfg->transfer_timeout_ms);
@@ -255,19 +261,23 @@ static size_t http_write_callback(void *data, size_t sz, size_t nmemb,
   WriteCtx *ctx = (WriteCtx *)user;
   size_t total = sz * nmemb;
 
-  if (total > ctx->remain) {
-    total = ctx->remain;
-  }
-  if (total == 0) {
-    return 0;
+  /* If we have no more room, still return the full size to indicate success
+     to CURL (otherwise it treats it as an error). We just won't copy data. */
+  if (ctx->remain == 0) {
+    return total;
   }
 
-  memcpy(ctx->dst, data, total);
-  ctx->dst += total;
-  ctx->written += total;
-  ctx->remain -= total;
+  size_t to_copy = total;
+  if (to_copy > ctx->remain) {
+    to_copy = ctx->remain;
+  }
 
-  return total;
+  memcpy(ctx->dst, data, to_copy);
+  ctx->dst += to_copy;
+  ctx->written += to_copy;
+  ctx->remain -= to_copy;
+
+  return total;  /* Always return total to signal success to CURL */
 }
 
 /* ==============================
@@ -283,27 +293,48 @@ static bool http_fetch_range(struct _openslide_http_file *f,
 
   WriteCtx ctx = {.dst = dst, .remain = len, .written = 0};
 
-  for (int retry = 0; retry <= cfg->retry_max; retry++) {
-    g_autofree gchar *range = g_strdup_printf(
-        "bytes=%" PRIu64 "-%" PRIu64,
-        offset + ctx.written,
-        offset + len - 1);
+  for (int retry = 0; retry <= (int)cfg->retry_max; retry++) {
+    /* Create a fresh CURL handle for each request (like reference impl) */
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+      g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                  "Failed to create CURL handle");
+      return false;
+    }
 
-    curl_easy_reset(f->curl);
-    http_curl_setup_common(f->curl, f->uri);
-    curl_easy_setopt(f->curl, CURLOPT_RANGE, range);
-    curl_easy_setopt(f->curl, CURLOPT_WRITEFUNCTION, http_write_callback);
-    curl_easy_setopt(f->curl, CURLOPT_WRITEDATA, &ctx);
+    /* Build Range header manually using CURLOPT_HTTPHEADER
+       (like reference implementation) instead of CURLOPT_RANGE */
+    char range_header[128];
+    snprintf(range_header, sizeof(range_header),
+             "Range: bytes=%" PRIu64 "-%" PRIu64,
+             offset + ctx.written,
+             offset + len - 1);
 
-    CURLcode code = curl_easy_perform(f->curl);
+    fprintf(stderr, "[HTTP-FETCH] %s\n", range_header);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, range_header);
+
+    http_curl_setup_common(curl, f->uri);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+
+    CURLcode code = curl_easy_perform(curl);
+    fprintf(stderr, "[HTTP-FETCH] CURL code=%d, written=%zu\n", code, ctx.written);
+
+    long http_code = 0;
     if (code == CURLE_OK) {
-      long http_code = 0;
-      curl_easy_getinfo(f->curl, CURLINFO_RESPONSE_CODE, &http_code);
-      /* Accept 200 (full content) and 206 (partial content) */
-      if (http_code == 200 || http_code == 206) {
-        *out_written = ctx.written;
-        return true;
-      }
+      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+      fprintf(stderr, "[HTTP-FETCH] HTTP code=%ld\n", http_code);
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (code == CURLE_OK && (http_code == 200 || http_code == 206)) {
+      *out_written = ctx.written;
+      return true;
     }
 
     /* Check if error is retryable */
@@ -313,11 +344,11 @@ static bool http_fetch_range(struct _openslide_http_file *f,
                           code == CURLE_SEND_ERROR ||
                           code == CURLE_GOT_NOTHING ||
                           code == CURLE_PARTIAL_FILE);
-    if (!retryable) {
+    if (!retryable && code != CURLE_OK) {
       break;
     }
 
-    if (retry < cfg->retry_max) {
+    if (retry < (int)cfg->retry_max) {
       g_usleep((gulong)cfg->retry_delay_ms * 1000 * (1u << retry));
     }
   }
@@ -522,11 +553,23 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
   /* Cleanup expired entries */
   pool_cleanup_expired();
 
-  /* Check if already in pool */
+  /* Check if already in pool - but create a NEW file handle with its own
+     position. The pool stores connection info (URL, size) and cached blocks,
+     but each caller gets an independent position (like reference impl).
+     
+     Actually, the current design shares position which is WRONG. Each
+     open should return a handle with position=0. For now, we reset position
+     when reusing from pool. A better design would be to separate the
+     "connection/cache" from "file handle with position". */
   struct _openslide_http_file *f = g_hash_table_lookup(file_pool, uri);
   if (f) {
     g_atomic_int_inc(&f->ref_count);
     f->last_access = g_get_monotonic_time() / G_USEC_PER_SEC;
+    /* CRITICAL: Reset position to 0 for new open - each caller expects
+       to start reading from the beginning of the file */
+    g_mutex_lock(&f->mutex);
+    f->position = 0;
+    g_mutex_unlock(&f->mutex);
     g_mutex_unlock(&pool_mutex);
     return f;
   }
