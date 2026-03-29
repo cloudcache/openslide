@@ -144,8 +144,10 @@ static struct _openslide_file *local_fopen(const char *path, GError **err) {
 struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
   /* Check if this is a remote URL */
   if (_openslide_is_remote_path(path)) {
+    fprintf(stderr, "[FILE] Opening remote path: %s\n", path);
     struct _openslide_http_file *http_handle = _openslide_http_open(path, err);
     if (!http_handle) {
+      fprintf(stderr, "[FILE] FAILED to open remote: %s\n", path);
       return NULL;
     }
 
@@ -153,6 +155,7 @@ struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
     file->type = FILE_TYPE_HTTP;
     file->u.http.handle = http_handle;
     file->u.http.uri = g_strdup(path);
+    fprintf(stderr, "[FILE] SUCCESS opened remote: %s\n", path);
     return file;
   }
 

@@ -299,6 +299,8 @@ static bool http_fetch_range(HttpConnection *conn,
              offset + ctx.written,
              offset + len - 1);
 
+    fprintf(stderr, "[HTTP-FETCH] %s\n", range_header);
+
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, range_header);
 
@@ -308,10 +310,12 @@ static bool http_fetch_range(HttpConnection *conn,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
 
     CURLcode code = curl_easy_perform(curl);
+    fprintf(stderr, "[HTTP-FETCH] CURL code=%d, written=%zu\n", code, ctx.written);
 
     long http_code = 0;
     if (code == CURLE_OK) {
       curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+      fprintf(stderr, "[HTTP-FETCH] HTTP code=%ld\n", http_code);
     }
 
     curl_slist_free_all(headers);
@@ -580,8 +584,11 @@ static HttpConnection *http_connection_get_or_create(const char *uri,
 
 struct _openslide_http_file *_openslide_http_open(const char *uri,
                                                    GError **err) {
+  fprintf(stderr, "[OPENSLIDE-HTTP] Opening: %s\n", uri);
+  
   HttpConnection *conn = http_connection_get_or_create(uri, err);
   if (!conn) {
+    fprintf(stderr, "[OPENSLIDE-HTTP] FAILED to open: %s\n", uri);
     return NULL;
   }
 
@@ -590,6 +597,8 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
   file->conn = conn;
   file->position = 0;
 
+  fprintf(stderr, "[OPENSLIDE-HTTP] SUCCESS opened: %s, size=%" PRIu64 "\n", 
+          uri, conn->file_size);
   return file;
 }
 
@@ -635,6 +644,15 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
   }
 
   file->position += (int64_t)total;
+
+  /* Debug: show first bytes read */
+  static int dbg_read_count = 0;
+  if (dbg_read_count < 5 && total > 0) {
+    dbg_read_count++;
+    unsigned char *p = (unsigned char *)buf;
+    fprintf(stderr, "[HTTP-READ] %zu bytes at pos %" PRId64 ", magic: %02x%02x%02x%02x\n",
+            total, pos, p[0], p[1], p[2], p[3]);
+  }
 
   return total;
 }
