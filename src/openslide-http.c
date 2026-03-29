@@ -92,7 +92,7 @@ static gboolean config_mutex_initialized = FALSE;
 
 static OpenslideHTTPConfig http_config = {
   .block_size = 1024 * 1024,       /* 1MB blocks - optimize for object storage (high latency, high bandwidth) */
-  .max_cache_blocks = 64,          /* 64MB max cache */
+  .max_cache_blocks = 0,           /* 0 = unlimited cache (like reference impl) - slides are repeatedly accessed */
   .retry_max = 3,
   .retry_delay_ms = 100,
   .connect_timeout_ms = 10000,
@@ -625,8 +625,8 @@ static bool http_fetch_blocks_range(HttpConnection *conn,
       return true;  /* Already cached */
     }
     
-    /* Evict if needed */
-    while (conn->cache_count >= cfg->max_cache_blocks) {
+    /* Evict if needed (0 = unlimited) */
+    while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
       lru_evict(conn);
     }
     g_mutex_unlock(&conn->mutex);
@@ -699,8 +699,8 @@ static bool http_fetch_blocks_range(HttpConnection *conn,
     b->len = block_len;
     memcpy(b->data, buffer + block_start_in_buf, block_len);
     
-    /* Evict if needed */
-    while (conn->cache_count >= cfg->max_cache_blocks) {
+    /* Evict if needed (0 = unlimited) */
+    while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
       lru_evict(conn);
     }
     
@@ -730,8 +730,9 @@ static HttpBlock *http_get_block(HttpConnection *conn,
 
   stats_record_cache(FALSE);
 
-  while (conn->cache_count >= cfg->max_cache_blocks) {
-    lru_evict(conn);
+    /* Only evict if max_cache_blocks > 0 (0 = unlimited) */
+    while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
+      lru_evict(conn);
   }
 
   uint64_t offset = block_idx * cfg->block_size;
