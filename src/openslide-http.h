@@ -97,4 +97,32 @@ const char *_openslide_http_get_uri(struct _openslide_http_file *file);
 /* Print global HTTP statistics to stderr */
 void _openslide_http_print_stats(void);
 
+/*
+ * Positional read (pread): read at offset without changing file position.
+ * More efficient than seek+read for random access patterns.
+ */
+size_t _openslide_http_pread(struct _openslide_http_file *file,
+                             uint64_t offset, void *buf, size_t size,
+                             GError **err);
+
+/*
+ * Zero-copy read API
+ * Returns a pointer to cached data, avoiding memcpy.
+ * The returned pointer is valid until the next operation on this file
+ * or until the cache evicts the block.
+ *
+ * Usage:
+ *   const uint8_t *ptr;
+ *   size_t avail;
+ *   if (_openslide_http_pread_ptr(file, offset, &ptr, &avail, err)) {
+ *     // use ptr[0..avail] directly, no copy needed
+ *     // avail may be less than requested if crossing block boundary
+ *   }
+ */
+bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
+                               uint64_t offset,
+                               const uint8_t **out_ptr,
+                               size_t *out_avail,
+                               GError **err);
+
 #endif /* OPENSLIDE_OPENSLIDE_HTTP_H_ */

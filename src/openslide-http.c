@@ -1161,6 +1161,93 @@ const char *_openslide_http_get_uri(struct _openslide_http_file *file) {
  * Global Stats API
  * ============================== */
 
+/* 
+ * Zero-copy pread: read at offset without changing file position.
+ * Uses pread_ptr internally, only copies if crossing block boundaries.
+ * For reads within a single block, this achieves near zero-copy
+ * (only final copy to user buffer if needed).
+ */
+size_t _openslide_http_pread(struct _openslide_http_file *file,
+                             uint64_t offset, void *buf, size_t size,
+                             GError **err) {
+  if (!file || !buf || size == 0) {
+    return 0;
+  }
+
+  HttpConnection *conn = file->conn;
+  uint8_t *dst = (uint8_t *)buf;
+  size_t total = 0;
+
+  if (offset >= conn->file_size) {
+    return 0;
+  }
+
+  size_t to_read = MIN(size, (size_t)(conn->file_size - offset));
+
+  while (total < to_read) {
+    const uint8_t *ptr;
+    size_t avail;
+    
+    if (!_openslide_http_pread_ptr(file, offset + total, &ptr, &avail, err)) {
+      break;
+    }
+    
+    if (avail == 0 || ptr == NULL) {
+      break;  /* EOF */
+    }
+    
+    size_t copy_len = MIN(to_read - total, avail);
+    memcpy(dst + total, ptr, copy_len);
+    total += copy_len;
+  }
+
+  return total;
+}
+
+/* Zero-copy read: returns pointer to cached block data */
+bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
+                               uint64_t offset,
+                               const uint8_t **out_ptr,
+                               size_t *out_avail,
+                               GError **err) {
+  if (!file || !out_ptr || !out_avail) {
+    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                "Invalid arguments to pread_ptr");
+    return false;
+  }
+
+  HttpConnection *conn = file->conn;
+  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+
+  if (offset >= conn->file_size) {
+    *out_ptr = NULL;
+    *out_avail = 0;
+    return true;  /* EOF, not an error */
+  }
+
+  /* Calculate which block contains this offset */
+  guint64 block_idx = offset / cfg->block_size;
+  uint32_t block_off = offset % cfg->block_size;
+
+  /* Get the block (may trigger fetch) */
+  HttpBlock *b = http_get_block(conn, block_idx, err);
+  if (!b) {
+    return false;
+  }
+
+  if (block_off >= b->len) {
+    *out_ptr = NULL;
+    *out_avail = 0;
+    return true;  /* EOF within block */
+  }
+
+  /* Return direct pointer to cached data - NO COPY */
+  *out_ptr = b->data + block_off;
+  *out_avail = b->len - block_off;
+
+  return true;
+}
+
 void _openslide_http_print_stats(void) {
   ensure_stats_mutex_init();
   g_mutex_lock(&stats_mutex);
