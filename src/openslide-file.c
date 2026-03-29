@@ -23,12 +23,14 @@
 #include <config.h>
 
 #include "openslide-private.h"
+#include "openslide-http.h"
 
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 #include <errno.h>
 #include <glib.h>
+#include <inttypes.h>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -42,9 +44,24 @@
 #define ftello _ftelli64
 #endif
 
+/* File type enumeration */
+typedef enum {
+  FILE_TYPE_LOCAL,
+  FILE_TYPE_HTTP,
+} FileType;
+
 struct _openslide_file {
-  FILE *fp;
-  char *path;
+  FileType type;
+  union {
+    struct {
+      FILE *fp;
+      char *path;
+    } local;
+    struct {
+      struct _openslide_http_file *handle;
+      char *uri;
+    } http;
+  } u;
 };
 
 struct _openslide_dir {
@@ -69,7 +86,11 @@ static void io_error(GError **err, const char *fmt, ...) {
   va_end(ap);
 }
 
-struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
+/* ==============================
+ * Local File Operations
+ * ============================== */
+
+static struct _openslide_file *local_fopen(const char *path, GError **err) {
   g_autoptr(FILE) f = NULL;
 
 #ifdef _WIN32
@@ -110,32 +131,82 @@ struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
 #endif
 
   struct _openslide_file *file = g_new0(struct _openslide_file, 1);
-  file->fp = g_steal_pointer(&f);
-  file->path = g_strdup(path);
+  file->type = FILE_TYPE_LOCAL;
+  file->u.local.fp = g_steal_pointer(&f);
+  file->u.local.path = g_strdup(path);
   return file;
 }
+
+/* ==============================
+ * Unified File Open (routing)
+ * ============================== */
+
+struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
+  /* Check if this is a remote URL */
+  if (_openslide_is_remote_path(path)) {
+    fprintf(stderr, "[OPENSLIDE-HTTP] Opening remote: %s\n", path);
+    struct _openslide_http_file *http_handle = _openslide_http_open(path, err);
+    if (!http_handle) {
+      fprintf(stderr, "[OPENSLIDE-HTTP] FAILED to open: %s, err=%s\n", 
+              path, err && *err ? (*err)->message : "NULL");
+      return NULL;
+    }
+
+    struct _openslide_file *file = g_new0(struct _openslide_file, 1);
+    file->type = FILE_TYPE_HTTP;
+    file->u.http.handle = http_handle;
+    file->u.http.uri = g_strdup(path);
+    fprintf(stderr, "[OPENSLIDE-HTTP] SUCCESS opened: %s, size=%ld\n", 
+            path, (long)_openslide_http_size(http_handle, NULL));
+    return file;
+  }
+
+  /* Local file */
+  return local_fopen(path, err);
+}
+
+/* ==============================
+ * Unified File Read
+ * ============================== */
 
 // returns 0/NULL on EOF and 0/non-NULL on I/O error
 size_t _openslide_fread(struct _openslide_file *file, void *buf, size_t size,
                         GError **err) {
+  if (file->type == FILE_TYPE_HTTP) {
+    size_t ret = _openslide_http_read(file->u.http.handle, buf, size, err);
+    static int dbg_cnt = 0;
+    if (dbg_cnt < 3 && ret > 0) {
+      dbg_cnt++;
+      unsigned char *p = buf;
+      fprintf(stderr, "[HTTP-READ] %zu bytes, magic: %02x%02x%02x%02x\n",
+              ret, p[0], p[1], p[2], p[3]);
+    }
+    return ret;
+  }
+
+  /* Local file */
   char *bufp = buf;
   size_t total = 0;
   while (total < size) {
-    size_t count = fread(bufp + total, 1, size - total, file->fp);  // ci-allow
+    size_t count = fread(bufp + total, 1, size - total, file->u.local.fp);  // ci-allow
     if (count == 0) {
       break;
     }
     total += count;
   }
-  if (total == 0 && ferror(file->fp)) {
+  if (total == 0 && ferror(file->u.local.fp)) {
     g_set_error(err, G_FILE_ERROR, G_FILE_ERROR_IO,
-                "I/O error reading file %s", file->path);
+                "I/O error reading file %s", file->u.local.path);
   }
   return total;
 }
 
 bool _openslide_fread_exact(struct _openslide_file *file,
                             void *buf, size_t size, GError **err) {
+  if (file->type == FILE_TYPE_HTTP) {
+    return _openslide_http_read_exact(file->u.http.handle, buf, size, err);
+  }
+
   GError *tmp_err = NULL;
   size_t count = _openslide_fread(file, buf, size, &tmp_err);
   if (tmp_err) {
@@ -144,30 +215,54 @@ bool _openslide_fread_exact(struct _openslide_file *file,
   } else if (count < size) {
     g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                 "Short read of file %s: %"PRIu64" < %"PRIu64,
-                file->path, (uint64_t) count, (uint64_t) size);
+                file->u.local.path, (uint64_t) count, (uint64_t) size);
     return false;
   }
   return true;
 }
+
+/* ==============================
+ * Unified File Seek
+ * ============================== */
 
 bool _openslide_fseek(struct _openslide_file *file, int64_t offset, int whence,
                       GError **err) {
-  if (fseeko(file->fp, offset, whence)) {  // ci-allow
-    io_error(err, "Couldn't seek file %s", file->path);
+  if (file->type == FILE_TYPE_HTTP) {
+    return _openslide_http_seek(file->u.http.handle, offset, whence, err);
+  }
+
+  if (fseeko(file->u.local.fp, offset, whence)) {  // ci-allow
+    io_error(err, "Couldn't seek file %s", file->u.local.path);
     return false;
   }
   return true;
 }
 
+/* ==============================
+ * Unified File Tell
+ * ============================== */
+
 int64_t _openslide_ftell(struct _openslide_file *file, GError **err) {
-  int64_t ret = ftello(file->fp);  // ci-allow
+  if (file->type == FILE_TYPE_HTTP) {
+    return _openslide_http_tell(file->u.http.handle, err);
+  }
+
+  int64_t ret = ftello(file->u.local.fp);  // ci-allow
   if (ret == -1) {
-    io_error(err, "Couldn't get offset of %s", file->path);
+    io_error(err, "Couldn't get offset of %s", file->u.local.path);
   }
   return ret;
 }
 
+/* ==============================
+ * Unified File Size
+ * ============================== */
+
 int64_t _openslide_fsize(struct _openslide_file *file, GError **err) {
+  if (file->type == FILE_TYPE_HTTP) {
+    return _openslide_http_size(file->u.http.handle, err);
+  }
+
   int64_t orig = _openslide_ftell(file, err);
   if (orig == -1) {
     g_prefix_error(err, "Couldn't get size: ");
@@ -189,15 +284,49 @@ int64_t _openslide_fsize(struct _openslide_file *file, GError **err) {
   return ret;
 }
 
+/* ==============================
+ * Unified File Close
+ * ============================== */
+
 void _openslide_fclose(struct _openslide_file *file) {
-  fclose(file->fp);  // ci-allow
-  g_free(file->path);
+  if (!file) {
+    return;
+  }
+
+  if (file->type == FILE_TYPE_HTTP) {
+    _openslide_http_close(file->u.http.handle);
+    g_free(file->u.http.uri);
+  } else {
+    fclose(file->u.local.fp);  // ci-allow
+    g_free(file->u.local.path);
+  }
   g_free(file);
 }
 
+/* ==============================
+ * File Exists (local only for now)
+ * ============================== */
+
 bool _openslide_fexists(const char *path, GError **err G_GNUC_UNUSED) {
+  /* For remote files, we'd need to do a HEAD request.
+     For now, only support local file existence check. */
+  if (_openslide_is_remote_path(path)) {
+    /* Attempt to open to verify existence */
+    GError *tmp_err = NULL;
+    struct _openslide_http_file *f = _openslide_http_open(path, &tmp_err);
+    if (f) {
+      _openslide_http_close(f);
+      return true;
+    }
+    g_clear_error(&tmp_err);
+    return false;
+  }
   return g_file_test(path, G_FILE_TEST_EXISTS);  // ci-allow
 }
+
+/* ==============================
+ * Directory Operations (local only)
+ * ============================== */
 
 struct _openslide_dir *_openslide_dir_open(const char *dirname, GError **err) {
   g_autoptr(_openslide_dir) d = g_new0(struct _openslide_dir, 1);
@@ -224,4 +353,18 @@ void _openslide_dir_close(struct _openslide_dir *d) {
   }
   g_free(d->path);
   g_free(d);
+}
+
+/* ==============================
+ * Utility: Get file path/uri for error messages
+ * ============================== */
+
+const char *_openslide_fget_path(struct _openslide_file *file) {
+  if (!file) {
+    return "(null)";
+  }
+  if (file->type == FILE_TYPE_HTTP) {
+    return file->u.http.uri;
+  }
+  return file->u.local.path;
 }
