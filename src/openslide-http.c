@@ -294,8 +294,10 @@ static bool http_fetch_range(struct _openslide_http_file *f,
   WriteCtx ctx = {.dst = dst, .remain = len, .written = 0};
 
   for (int retry = 0; retry <= (int)cfg->retry_max; retry++) {
+    /* CURLOPT_RANGE expects "start-end" format WITHOUT "bytes=" prefix.
+       CURL will add the "Range: bytes=" header automatically. */
     g_autofree gchar *range = g_strdup_printf(
-        "bytes=%" PRIu64 "-%" PRIu64,
+        "%" PRIu64 "-%" PRIu64,
         offset + ctx.written,
         offset + len - 1);
 
