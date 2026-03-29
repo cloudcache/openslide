@@ -347,6 +347,8 @@ func (s *Server) handleDZI(c *gin.Context) {
 
 // handleTileFromDZI handles tile requests that come through /dzi/ path.
 func (s *Server) handleTileFromDZI(c *gin.Context, fullPath string) {
+	start := time.Now()
+	
 	// Parse: /path/to/slide.svs_files/12/3_4.jpeg
 	filesIdx := strings.LastIndex(fullPath, "_files/")
 	if filesIdx == -1 {
@@ -394,16 +396,30 @@ func (s *Server) handleTileFromDZI(c *gin.Context, fullPath string) {
 		return
 	}
 
+	parseTime := time.Since(start)
+
+	slideStart := time.Now()
 	entry, err := s.getSlide(sp)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "failed to open slide: " + sp.String()})
 		return
 	}
+	slideTime := time.Since(slideStart)
 
+	tileStart := time.Now()
 	tile, err := entry.generator.GetTile(level, col, row)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	tileTime := time.Since(tileStart)
+
+	totalTime := time.Since(start)
+	
+	// Log detailed timing for remote tiles
+	if sp.IsRemote() {
+		log.Printf("[TILE] %s level=%d col=%d row=%d | parse=%v slide=%v tile=%v total=%v",
+			tilePart, level, col, row, parseTime, slideTime, tileTime, totalTime)
 	}
 
 	contentType := "image/jpeg"

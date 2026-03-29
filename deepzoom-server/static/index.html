@@ -89,11 +89,11 @@
             </button>
         </div>
         <!-- Quick Examples -->
-        <div class="flex items-center gap-2 text-xs">
+        <div class="flex items-center gap-2 text-xs flex-wrap">
             <span class="text-muted-foreground">Examples:</span>
             <button class="example-btn px-2 py-1 bg-muted hover:bg-accent rounded transition"
-                data-local="" data-remote="https://storage.googleapis.com/imagebox_test/openslide-testdata/Aperio/CMU-1.svs">
-                GCS CMU-1
+                data-local="/data/slides/CMU-1.svs" data-remote="https://storage.googleapis.com/imagebox_test/openslide-testdata/Aperio/CMU-1.svs">
+                CMU-1 (Local vs Remote)
             </button>
             <button class="example-btn px-2 py-1 bg-muted hover:bg-accent rounded transition"
                 data-local="" data-remote="https://storage.googleapis.com/imagebox_test/openslide-testdata/Aperio/CMU-2.svs">
@@ -103,6 +103,11 @@
                 data-local="" data-remote="https://storage.googleapis.com/imagebox_test/openslide-testdata/Hamamatsu/CMU-1.ndpi">
                 GCS NDPI
             </button>
+        </div>
+        <div class="text-xs text-muted-foreground">
+            <span class="font-medium">Local path:</span> 服务器上的绝对路径，如 <code class="bg-muted px-1 rounded">/data/slides/test.svs</code>
+            &nbsp;|&nbsp;
+            <span class="font-medium">Remote:</span> HTTP/HTTPS URL
         </div>
     </div>
 
