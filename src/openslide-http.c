@@ -236,11 +236,9 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 60L);
   
-  /* Disable Accept-Encoding to ensure we get raw uncompressed data.
-     This is important for Range requests on binary files. */
-  curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
-  /* Also disable HTTP/2 server push which can cause issues */
-  curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+  /* Enable automatic decompression - empty string means accept all
+     supported encodings and let CURL handle decompression automatically */
+  curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
 
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)cfg->connect_timeout_ms);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)cfg->transfer_timeout_ms);
