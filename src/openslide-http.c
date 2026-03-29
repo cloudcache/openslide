@@ -294,33 +294,47 @@ static bool http_fetch_range(struct _openslide_http_file *f,
   WriteCtx ctx = {.dst = dst, .remain = len, .written = 0};
 
   for (int retry = 0; retry <= (int)cfg->retry_max; retry++) {
-    /* CURLOPT_RANGE expects "start-end" format WITHOUT "bytes=" prefix.
-       CURL will add the "Range: bytes=" header automatically. */
-    g_autofree gchar *range = g_strdup_printf(
-        "%" PRIu64 "-%" PRIu64,
-        offset + ctx.written,
-        offset + len - 1);
+    /* Create a fresh CURL handle for each request (like reference impl) */
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+      g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                  "Failed to create CURL handle");
+      return false;
+    }
 
-    fprintf(stderr, "[HTTP-FETCH] Range: %s\n", range);
+    /* Build Range header manually using CURLOPT_HTTPHEADER
+       (like reference implementation) instead of CURLOPT_RANGE */
+    char range_header[128];
+    snprintf(range_header, sizeof(range_header),
+             "Range: bytes=%" PRIu64 "-%" PRIu64,
+             offset + ctx.written,
+             offset + len - 1);
 
-    curl_easy_reset(f->curl);
-    http_curl_setup_common(f->curl, f->uri);
-    curl_easy_setopt(f->curl, CURLOPT_RANGE, range);
-    curl_easy_setopt(f->curl, CURLOPT_WRITEFUNCTION, http_write_callback);
-    curl_easy_setopt(f->curl, CURLOPT_WRITEDATA, &ctx);
+    fprintf(stderr, "[HTTP-FETCH] %s\n", range_header);
 
-    CURLcode code = curl_easy_perform(f->curl);
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, range_header);
+
+    http_curl_setup_common(curl, f->uri);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+
+    CURLcode code = curl_easy_perform(curl);
     fprintf(stderr, "[HTTP-FETCH] CURL code=%d, written=%zu\n", code, ctx.written);
-    
+
+    long http_code = 0;
     if (code == CURLE_OK) {
-      long http_code = 0;
-      curl_easy_getinfo(f->curl, CURLINFO_RESPONSE_CODE, &http_code);
+      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
       fprintf(stderr, "[HTTP-FETCH] HTTP code=%ld\n", http_code);
-      /* Accept 200 (full content) and 206 (partial content) */
-      if (http_code == 200 || http_code == 206) {
-        *out_written = ctx.written;
-        return true;
-      }
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (code == CURLE_OK && (http_code == 200 || http_code == 206)) {
+      *out_written = ctx.written;
+      return true;
     }
 
     /* Check if error is retryable */
@@ -330,11 +344,11 @@ static bool http_fetch_range(struct _openslide_http_file *f,
                           code == CURLE_SEND_ERROR ||
                           code == CURLE_GOT_NOTHING ||
                           code == CURLE_PARTIAL_FILE);
-    if (!retryable) {
+    if (!retryable && code != CURLE_OK) {
       break;
     }
 
-    if (retry < cfg->retry_max) {
+    if (retry < (int)cfg->retry_max) {
       g_usleep((gulong)cfg->retry_delay_ms * 1000 * (1u << retry));
     }
   }
