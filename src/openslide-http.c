@@ -236,9 +236,11 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 60L);
   
-  /* Enable automatic decompression - empty string means accept all
-     supported encodings and let CURL handle decompression automatically */
-  curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+  /* Do NOT set CURLOPT_ACCEPT_ENCODING for Range requests.
+     Setting it to "" causes CURL to send "Accept-Encoding: gzip, deflate",
+     which makes many servers (including GCS) ignore the Range header and
+     return the full compressed content (HTTP 200) instead of partial
+     content (HTTP 206). We need raw bytes for Range requests. */
 
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)cfg->connect_timeout_ms);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)cfg->transfer_timeout_ms);
