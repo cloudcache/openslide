@@ -425,6 +425,69 @@ static size_t http_write_callback(void *data, size_t sz, size_t nmemb,
 }
 
 /* ==============================
+ * Async Download Manager using curl_multi
+ * ============================== */
+
+typedef struct {
+  CURLM *multi_handle;
+  GMutex mutex;
+  gboolean initialized;
+} AsyncDownloader;
+
+static AsyncDownloader g_downloader = {0};
+
+static void async_downloader_init(void) {
+  static gsize init_once = 0;
+  if (g_once_init_enter(&init_once)) {
+    g_mutex_init(&g_downloader.mutex);
+    g_downloader.multi_handle = curl_multi_init();
+    if (g_downloader.multi_handle) {
+      /* Enable HTTP/2 multiplexing if available */
+#ifdef CURLMOPT_PIPELINING
+      curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+#endif
+      /* Max connections per host */
+      curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_MAX_HOST_CONNECTIONS, 8L);
+      curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_MAX_TOTAL_CONNECTIONS, 16L);
+    }
+    g_downloader.initialized = TRUE;
+    g_once_init_leave(&init_once, 1);
+  }
+}
+
+/* Perform multi requests until all complete or timeout */
+static int async_multi_perform(CURLM *multi_handle, long timeout_ms) {
+  int still_running = 0;
+  gint64 start = g_get_monotonic_time();
+  gint64 deadline = start + timeout_ms * 1000;
+  
+  do {
+    CURLMcode mc = curl_multi_perform(multi_handle, &still_running);
+    if (mc != CURLM_OK) {
+      break;
+    }
+    
+    if (still_running == 0) {
+      break;
+    }
+    
+    /* Wait for activity with short timeout */
+    int numfds = 0;
+    mc = curl_multi_wait(multi_handle, NULL, 0, 100, &numfds);
+    if (mc != CURLM_OK) {
+      break;
+    }
+    
+    /* Check deadline */
+    if (g_get_monotonic_time() > deadline) {
+      break;
+    }
+  } while (still_running);
+  
+  return still_running;
+}
+
+/* ==============================
  * Range Fetch
  * ============================== */
 
@@ -549,6 +612,202 @@ static void lru_evict(HttpConnection *conn) {
   g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(idx));
   conn->lru_list = g_list_delete_link(conn->lru_list, last);
   conn->cache_count--;
+}
+
+/* ==============================
+ * Parallel Fetch using curl_multi (like reference implementation)
+ * ============================== */
+
+typedef struct {
+  uint8_t *buffer;
+  size_t buffer_len;
+  size_t buffer_pos;
+  uint64_t offset;
+  size_t len;
+} ParallelFetchCtx;
+
+static size_t parallel_write_callback(void *data, size_t sz, size_t nmemb, void *userp) {
+  ParallelFetchCtx *ctx = (ParallelFetchCtx *)userp;
+  size_t total = sz * nmemb;
+  size_t remain = ctx->buffer_len - ctx->buffer_pos;
+  size_t to_copy = MIN(total, remain);
+  
+  if (to_copy > 0) {
+    memcpy(ctx->buffer + ctx->buffer_pos, data, to_copy);
+    ctx->buffer_pos += to_copy;
+  }
+  
+  return total;
+}
+
+/* Fetch multiple ranges in parallel using curl_multi */
+static bool http_fetch_parallel(HttpConnection *conn,
+                                uint64_t *offsets, size_t *lens,
+                                uint8_t **buffers, size_t count,
+                                GError **err) {
+  async_downloader_init();
+  
+  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+  CURLM *multi_handle = curl_multi_init();
+  if (!multi_handle) {
+    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                "Failed to init curl_multi");
+    return false;
+  }
+  
+  /* Setup parallel contexts */
+  ParallelFetchCtx *ctxs = g_new0(ParallelFetchCtx, count);
+  CURL **handles = g_new0(CURL*, count);
+  struct curl_slist **header_lists = g_new0(struct curl_slist*, count);
+  
+  for (size_t i = 0; i < count; i++) {
+    ctxs[i].buffer = buffers[i];
+    ctxs[i].buffer_len = lens[i];
+    ctxs[i].buffer_pos = 0;
+    ctxs[i].offset = offsets[i];
+    ctxs[i].len = lens[i];
+    
+    handles[i] = curl_easy_init();
+    if (!handles[i]) continue;
+    
+    char range_header[128];
+    snprintf(range_header, sizeof(range_header),
+             "Range: bytes=%" PRIu64 "-%" PRIu64,
+             offsets[i], offsets[i] + lens[i] - 1);
+    
+    header_lists[i] = curl_slist_append(NULL, range_header);
+    
+    http_curl_setup_common(handles[i], conn->uri);
+    curl_easy_setopt(handles[i], CURLOPT_HTTPHEADER, header_lists[i]);
+    curl_easy_setopt(handles[i], CURLOPT_WRITEFUNCTION, parallel_write_callback);
+    curl_easy_setopt(handles[i], CURLOPT_WRITEDATA, &ctxs[i]);
+    
+    curl_multi_add_handle(multi_handle, handles[i]);
+  }
+  
+  /* Perform all requests in parallel */
+  async_multi_perform(multi_handle, cfg->transfer_timeout_ms);
+  
+  /* Check results and cleanup */
+  bool all_ok = true;
+  for (size_t i = 0; i < count; i++) {
+    if (handles[i]) {
+      long http_code = 0;
+      curl_easy_getinfo(handles[i], CURLINFO_RESPONSE_CODE, &http_code);
+      if (http_code != 200 && http_code != 206) {
+        all_ok = false;
+      }
+      
+      curl_multi_remove_handle(multi_handle, handles[i]);
+      curl_easy_cleanup(handles[i]);
+    }
+    if (header_lists[i]) {
+      curl_slist_free_all(header_lists[i]);
+    }
+  }
+  
+  curl_multi_cleanup(multi_handle);
+  g_free(ctxs);
+  g_free(handles);
+  g_free(header_lists);
+  
+  return all_ok;
+}
+
+/* ==============================
+ * Extent Merge: Fetch multiple consecutive missing blocks in one request
+ * ============================== */
+
+/* Find missing blocks in range [start, end] and fetch them together */
+static bool http_fetch_extent(HttpConnection *conn,
+                              guint64 start_block, guint64 end_block,
+                              GError **err) {
+  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+  
+  /* Limit extent size to avoid huge single requests */
+  const guint64 max_extent_blocks = 8;  /* Max 8MB per request */
+  if (end_block - start_block + 1 > max_extent_blocks) {
+    end_block = start_block + max_extent_blocks - 1;
+  }
+  
+  /* Calculate byte range */
+  uint64_t start_offset = start_block * cfg->block_size;
+  uint64_t end_offset = (end_block + 1) * cfg->block_size;
+  
+  if (start_offset >= conn->file_size) {
+    return true;  /* Nothing to fetch */
+  }
+  if (end_offset > conn->file_size) {
+    end_offset = conn->file_size;
+  }
+  
+  size_t total_len = (size_t)(end_offset - start_offset);
+  if (total_len == 0) {
+    return true;
+  }
+  
+  HTTP_LOG("[HTTP-EXTENT] Fetching blocks %" PRIu64 "-%" PRIu64 " (%zu bytes)\n",
+           start_block, end_block, total_len);
+  
+  /* Allocate buffer for entire extent */
+  uint8_t *buffer = g_malloc(total_len);
+  size_t written = 0;
+  
+  if (!http_fetch_range(conn, start_offset, total_len, buffer, &written, err)) {
+    g_free(buffer);
+    return false;
+  }
+  
+  /* Split into blocks and cache them */
+  g_mutex_lock(&conn->cache_mutex);
+  
+  for (guint64 idx = start_block; idx <= end_block; idx++) {
+    /* Skip if already cached by another thread */
+    HttpBlock *existing = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
+    if (existing && existing->state == BLOCK_STATE_READY) {
+      continue;
+    }
+    
+    uint64_t block_start = (idx - start_block) * cfg->block_size;
+    uint64_t block_end = block_start + cfg->block_size;
+    if (block_end > written) {
+      block_end = written;
+    }
+    if (block_start >= written) {
+      break;
+    }
+    
+    size_t block_len = (size_t)(block_end - block_start);
+    
+    HttpBlock *b = existing;
+    if (!b) {
+      b = g_new0(HttpBlock, 1);
+      g_cond_init(&b->fetch_cond);
+      b->lru_node = g_list_alloc();
+      b->lru_node->data = GUINT_TO_POINTER(idx);
+      
+      /* Evict if needed */
+      while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
+        lru_evict(conn);
+      }
+      
+      g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(idx), b);
+      conn->lru_list = g_list_concat(b->lru_node, conn->lru_list);
+      conn->cache_count++;
+    }
+    
+    /* Copy data to block */
+    b->data = g_malloc(block_len);
+    memcpy(b->data, buffer + block_start, block_len);
+    b->len = block_len;
+    b->state = BLOCK_STATE_READY;
+    g_cond_broadcast(&b->fetch_cond);
+  }
+  
+  g_mutex_unlock(&conn->cache_mutex);
+  g_free(buffer);
+  
+  return true;
 }
 
 /* ==============================
@@ -898,6 +1157,9 @@ static HttpConnection *http_connection_get_or_create(const char *uri, GError **e
  * Public File API
  * ============================== */
 
+/* Prefetch first N blocks on open - covers TIFF header/directory/tile map */
+#define PREFETCH_BLOCKS_ON_OPEN 4  /* 4MB by default */
+
 struct _openslide_http_file *_openslide_http_open(const char *uri,
                                                    GError **err) {
   HttpConnection *conn = http_connection_get_or_create(uri, err);
@@ -911,6 +1173,19 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
   file->last_read_end = -1;
   file->last_block_idx = G_MAXUINT64;
   file->sequential_hits = 0;
+
+  /* Prefetch metadata blocks - greatly reduces first tile latency */
+  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+  guint64 max_prefetch_blocks = (conn->file_size + cfg->block_size - 1) / cfg->block_size;
+  if (max_prefetch_blocks > PREFETCH_BLOCKS_ON_OPEN) {
+    max_prefetch_blocks = PREFETCH_BLOCKS_ON_OPEN;
+  }
+  
+  if (max_prefetch_blocks > 0) {
+    HTTP_LOG("[HTTP-PREFETCH] Prefetching first %" PRIu64 " blocks for %s\n",
+             max_prefetch_blocks, uri);
+    http_fetch_extent(conn, 0, max_prefetch_blocks - 1, NULL);
+  }
 
   return file;
 }
@@ -985,8 +1260,34 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
 
   uint64_t avail = file_size - (uint64_t)pos;
   size_t to_read = MIN(size, (size_t)avail);
+  
+  /* Calculate block range needed */
+  guint64 start_block = (uint64_t)pos / cfg->block_size;
+  guint64 end_block = (uint64_t)(pos + (int64_t)to_read - 1) / cfg->block_size;
+  
+  /* Scan for missing blocks and prefetch as extent */
+  g_mutex_lock(&conn->cache_mutex);
+  guint64 miss_start = G_MAXUINT64;
+  guint64 miss_end = 0;
+  
+  for (guint64 idx = start_block; idx <= end_block; idx++) {
+    HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
+    if (!b || b->state != BLOCK_STATE_READY) {
+      if (miss_start == G_MAXUINT64) {
+        miss_start = idx;
+      }
+      miss_end = idx;
+    }
+  }
+  g_mutex_unlock(&conn->cache_mutex);
+  
+  /* Fetch missing extent in one request */
+  if (miss_start != G_MAXUINT64) {
+    http_fetch_extent(conn, miss_start, miss_end, err);
+  }
+  
+  /* Now read from cache */
   size_t total = 0;
-
   while (total < to_read) {
     guint64 block_idx = (uint64_t)(pos + (int64_t)total) / cfg->block_size;
     uint32_t block_off = (uint64_t)(pos + (int64_t)total) % cfg->block_size;
