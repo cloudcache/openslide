@@ -545,9 +545,24 @@ static void lru_promote(HttpConnection *conn, guint64 idx) {
 }
 
 static void lru_evict(HttpConnection *conn) {
-  if (conn->cache_count == 0 || conn->lru_list == NULL) {
+  if (!conn->lru_list) {
     return;
   }
+  GList *last = g_list_last(conn->lru_list);
+  if (!last) {
+    return;
+  }
+  guint64 idx = GPOINTER_TO_UINT(last->data);
+  HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
+  if (b) {
+    g_free(b->data);
+    b->data = NULL;
+    g_free(b);
+  }
+  g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(idx));
+  conn->lru_list = g_list_delete_link(conn->lru_list, last);
+  conn->cache_count--;
+}
 
   GList *last = g_list_last(conn->lru_list);
   if (!last) {
@@ -560,6 +575,7 @@ static void lru_evict(HttpConnection *conn) {
   HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(last_idx));
   if (b) {
     g_free(b->data);
+    b->data = NULL;
     g_free(b);
   }
   g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(last_idx));
@@ -642,7 +658,9 @@ static bool http_fetch_blocks_range(HttpConnection *conn,
     HttpBlock *existing = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(start_block));
     if (existing) {
       g_free(b->data);
+      b->data = NULL;
       g_free(b);
+      b = NULL;
     } else {
       g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(start_block), b);
       conn->lru_list = g_list_prepend(conn->lru_list, GUINT_TO_POINTER(start_block));
@@ -765,7 +783,9 @@ static HttpBlock *http_get_block(HttpConnection *conn,
   if (!http_fetch_range(conn, offset, len, b->data, &written, err) ||
       written == 0) {
     g_free(b->data);
+    b->data = NULL;
     g_free(b);
+    b = NULL;
     return NULL;
   }
 
@@ -775,7 +795,9 @@ static HttpBlock *http_get_block(HttpConnection *conn,
                                             GUINT_TO_POINTER(block_idx));
   if (existing) {
     g_free(b->data);
+    b->data = NULL;
     g_free(b);
+    b = NULL;
     lru_promote(conn, block_idx);
     g_mutex_unlock(&conn->mutex);
     return existing;
@@ -826,14 +848,23 @@ static void http_connection_destroy(HttpConnection *conn) {
     g_hash_table_iter_init(&iter, conn->block_map);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
       HttpBlock *b = value;
-      g_free(b->data);
-      g_free(b);
+      if (b) {
+        g_free(b->data);
+        b->data = NULL;
+        g_free(b);
+      }
     }
     g_hash_table_destroy(conn->block_map);
+    conn->block_map = NULL;
   }
 
-  g_list_free(conn->lru_list);
+  if (conn->lru_list) {
+    g_list_free(conn->lru_list);
+    conn->lru_list = NULL;
+  }
+  
   g_free(conn->uri);
+  conn->uri = NULL;
   g_mutex_clear(&conn->mutex);
   g_free(conn);
 }
@@ -1154,6 +1185,7 @@ void _openslide_http_close(struct _openslide_http_file *file) {
   }
 
   http_connection_unref(file->conn);
+  file->conn = NULL;
   g_free(file);
 }
 
