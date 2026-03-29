@@ -564,24 +564,6 @@ static void lru_evict(HttpConnection *conn) {
   conn->cache_count--;
 }
 
-  GList *last = g_list_last(conn->lru_list);
-  if (!last) {
-    return;
-  }
-
-  guint64 last_idx = GPOINTER_TO_UINT(last->data);
-  conn->lru_list = g_list_delete_link(conn->lru_list, last);
-
-  HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(last_idx));
-  if (b) {
-    g_free(b->data);
-    b->data = NULL;
-    g_free(b);
-  }
-  g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(last_idx));
-  conn->cache_count--;
-}
-
 /* ==============================
  * Block Fetch
  * ============================== */
