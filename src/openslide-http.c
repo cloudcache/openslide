@@ -80,19 +80,24 @@ typedef struct {
   size_t len;
 } HttpBlock;
 
-struct _openslide_http_file {
-  CURL *curl;
+/* Shared connection info - cached in pool, shared by multiple file handles */
+typedef struct _http_connection {
   gchar *uri;
   uint64_t file_size;
-  int64_t position;       /* current read position */
 
   GHashTable *block_map;  /* block_idx -> HttpBlock* */
   GList *lru_list;        /* LRU list of block indices */
   guint cache_count;
 
-  gint ref_count;
+  gint ref_count;         /* Number of file handles using this connection */
   gint64 last_access;
   GMutex mutex;
+} HttpConnection;
+
+/* Per-open file handle - each caller gets their own with independent position */
+struct _openslide_http_file {
+  HttpConnection *conn;   /* Shared connection (has its own refcount) */
+  int64_t position;       /* This handle's read position - NOT shared */
 };
 
 typedef struct {
@@ -107,7 +112,7 @@ typedef struct {
 
 static GMutex pool_mutex;
 static gboolean pool_mutex_initialized = FALSE;
-static GHashTable *file_pool = NULL;  /* uri -> _openslide_http_file* */
+static GHashTable *conn_pool = NULL;  /* uri -> HttpConnection* */
 static CURLSH *curl_share = NULL;
 static gboolean http_initialized = FALSE;
 
@@ -186,7 +191,7 @@ void _openslide_http_init(void) {
       curl_share_setopt(curl_share, CURLSHOPT_UNLOCKFUNC, curl_unlock_cb);
     }
 
-    file_pool = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    conn_pool = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     http_initialized = TRUE;
   }
   g_mutex_unlock(&pool_mutex);
@@ -197,17 +202,9 @@ void _openslide_http_cleanup(void) {
 
   g_mutex_lock(&pool_mutex);
   if (http_initialized) {
-    if (file_pool) {
-      /* Close all remaining files */
-      GList *values = g_hash_table_get_values(file_pool);
-      for (GList *l = values; l; l = l->next) {
-        struct _openslide_http_file *f = l->data;
-        /* Force cleanup regardless of ref count */
-        f->ref_count = 1;
-      }
-      g_list_free(values);
-      g_hash_table_destroy(file_pool);
-      file_pool = NULL;
+    if (conn_pool) {
+      g_hash_table_destroy(conn_pool);
+      conn_pool = NULL;
     }
 
     if (curl_share) {
@@ -238,12 +235,6 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
   
   /* Set a proper User-Agent - some servers require this */
   curl_easy_setopt(curl, CURLOPT_USERAGENT, "OpenSlide/4.0 libcurl");
-  
-  /* Do NOT set CURLOPT_ACCEPT_ENCODING for Range requests.
-     Setting it to "" causes CURL to send "Accept-Encoding: gzip, deflate",
-     which makes many servers (including GCS) ignore the Range header and
-     return the full compressed content (HTTP 200) instead of partial
-     content (HTTP 206). We need raw bytes for Range requests. */
 
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)cfg->connect_timeout_ms);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)cfg->transfer_timeout_ms);
@@ -264,8 +255,6 @@ static size_t http_write_callback(void *data, size_t sz, size_t nmemb,
   WriteCtx *ctx = (WriteCtx *)user;
   size_t total = sz * nmemb;
 
-  /* If we have no more room, still return the full size to indicate success
-     to CURL (otherwise it treats it as an error). We just won't copy data. */
   if (ctx->remain == 0) {
     return total;
   }
@@ -280,14 +269,14 @@ static size_t http_write_callback(void *data, size_t sz, size_t nmemb,
   ctx->written += to_copy;
   ctx->remain -= to_copy;
 
-  return total;  /* Always return total to signal success to CURL */
+  return total;
 }
 
 /* ==============================
  * Range Fetch with Retry
  * ============================== */
 
-static bool http_fetch_range(struct _openslide_http_file *f,
+static bool http_fetch_range(HttpConnection *conn,
                              uint64_t offset, size_t len,
                              uint8_t *dst, size_t *out_written,
                              GError **err) {
@@ -297,7 +286,6 @@ static bool http_fetch_range(struct _openslide_http_file *f,
   WriteCtx ctx = {.dst = dst, .remain = len, .written = 0};
 
   for (int retry = 0; retry <= (int)cfg->retry_max; retry++) {
-    /* Create a fresh CURL handle for each request (like reference impl) */
     CURL *curl = curl_easy_init();
     if (!curl) {
       g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
@@ -305,8 +293,6 @@ static bool http_fetch_range(struct _openslide_http_file *f,
       return false;
     }
 
-    /* Build Range header manually using CURLOPT_HTTPHEADER
-       (like reference implementation) instead of CURLOPT_RANGE */
     char range_header[128];
     snprintf(range_header, sizeof(range_header),
              "Range: bytes=%" PRIu64 "-%" PRIu64,
@@ -316,7 +302,7 @@ static bool http_fetch_range(struct _openslide_http_file *f,
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, range_header);
 
-    http_curl_setup_common(curl, f->uri);
+    http_curl_setup_common(curl, conn->uri);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
@@ -336,7 +322,6 @@ static bool http_fetch_range(struct _openslide_http_file *f,
       return true;
     }
 
-    /* Check if error is retryable */
     gboolean retryable = (code == CURLE_COULDNT_CONNECT ||
                           code == CURLE_OPERATION_TIMEDOUT ||
                           code == CURLE_RECV_ERROR ||
@@ -358,7 +343,7 @@ static bool http_fetch_range(struct _openslide_http_file *f,
   }
 
   g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
-              "HTTP range request failed for %s", f->uri);
+              "HTTP range request failed for %s", conn->uri);
   return false;
 }
 
@@ -366,214 +351,163 @@ static bool http_fetch_range(struct _openslide_http_file *f,
  * LRU Cache Management
  * ============================== */
 
-static void lru_promote(struct _openslide_http_file *f, guint64 idx) {
-  /* Remove from current position and add to front */
-  f->lru_list = g_list_remove(f->lru_list, GUINT_TO_POINTER(idx));
-  f->lru_list = g_list_prepend(f->lru_list, GUINT_TO_POINTER(idx));
+static void lru_promote(HttpConnection *conn, guint64 idx) {
+  conn->lru_list = g_list_remove(conn->lru_list, GUINT_TO_POINTER(idx));
+  conn->lru_list = g_list_prepend(conn->lru_list, GUINT_TO_POINTER(idx));
 }
 
-static void lru_evict(struct _openslide_http_file *f) {
-  if (f->cache_count == 0 || f->lru_list == NULL) {
+static void lru_evict(HttpConnection *conn) {
+  if (conn->cache_count == 0 || conn->lru_list == NULL) {
     return;
   }
 
-  GList *last = g_list_last(f->lru_list);
+  GList *last = g_list_last(conn->lru_list);
   if (!last) {
     return;
   }
 
   guint64 last_idx = GPOINTER_TO_UINT(last->data);
-  f->lru_list = g_list_delete_link(f->lru_list, last);
+  conn->lru_list = g_list_delete_link(conn->lru_list, last);
 
-  HttpBlock *b = g_hash_table_lookup(f->block_map, GUINT_TO_POINTER(last_idx));
+  HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(last_idx));
   if (b) {
     g_free(b->data);
     g_free(b);
   }
-  g_hash_table_remove(f->block_map, GUINT_TO_POINTER(last_idx));
-  f->cache_count--;
+  g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(last_idx));
+  conn->cache_count--;
 }
 
 /* ==============================
  * Block Fetch
  * ============================== */
 
-static HttpBlock *http_get_block(struct _openslide_http_file *f,
+static HttpBlock *http_get_block(HttpConnection *conn,
                                  guint64 block_idx, GError **err) {
   const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
 
-  g_mutex_lock(&f->mutex);
+  g_mutex_lock(&conn->mutex);
 
-  /* Check cache first */
-  HttpBlock *b = g_hash_table_lookup(f->block_map, GUINT_TO_POINTER(block_idx));
+  HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(block_idx));
   if (b) {
-    lru_promote(f, block_idx);
-    g_mutex_unlock(&f->mutex);
+    lru_promote(conn, block_idx);
+    g_mutex_unlock(&conn->mutex);
     return b;
   }
 
-  /* Evict if necessary */
-  while (f->cache_count >= cfg->max_cache_blocks) {
-    lru_evict(f);
+  while (conn->cache_count >= cfg->max_cache_blocks) {
+    lru_evict(conn);
   }
 
-  /* Calculate range */
   uint64_t offset = block_idx * cfg->block_size;
   size_t len = cfg->block_size;
 
-  if (offset >= f->file_size) {
-    g_mutex_unlock(&f->mutex);
+  if (offset >= conn->file_size) {
+    g_mutex_unlock(&conn->mutex);
     g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                 "Block offset %" PRIu64 " beyond file size %" PRIu64,
-                offset, f->file_size);
+                offset, conn->file_size);
     return NULL;
   }
-  if (offset + len > f->file_size) {
-    len = (size_t)(f->file_size - offset);
+  if (offset + len > conn->file_size) {
+    len = (size_t)(conn->file_size - offset);
   }
 
-  /* Allocate block */
   b = g_new0(HttpBlock, 1);
   b->data = g_malloc(len);
   b->len = len;
 
-  /* Fetch data (release lock during network I/O) */
-  g_mutex_unlock(&f->mutex);
+  g_mutex_unlock(&conn->mutex);
 
   size_t written;
-  if (!http_fetch_range(f, offset, len, b->data, &written, err) ||
+  if (!http_fetch_range(conn, offset, len, b->data, &written, err) ||
       written == 0) {
     g_free(b->data);
     g_free(b);
     return NULL;
   }
 
-  /* Re-acquire lock and insert into cache */
-  g_mutex_lock(&f->mutex);
+  g_mutex_lock(&conn->mutex);
 
-  /* Check if another thread already cached this block */
-  HttpBlock *existing = g_hash_table_lookup(f->block_map,
+  HttpBlock *existing = g_hash_table_lookup(conn->block_map,
                                             GUINT_TO_POINTER(block_idx));
   if (existing) {
     g_free(b->data);
     g_free(b);
-    lru_promote(f, block_idx);
-    g_mutex_unlock(&f->mutex);
+    lru_promote(conn, block_idx);
+    g_mutex_unlock(&conn->mutex);
     return existing;
   }
 
   b->len = written;
-  g_hash_table_insert(f->block_map, GUINT_TO_POINTER(block_idx), b);
-  f->lru_list = g_list_prepend(f->lru_list, GUINT_TO_POINTER(block_idx));
-  f->cache_count++;
+  g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(block_idx), b);
+  conn->lru_list = g_list_prepend(conn->lru_list, GUINT_TO_POINTER(block_idx));
+  conn->cache_count++;
 
-  g_mutex_unlock(&f->mutex);
+  g_mutex_unlock(&conn->mutex);
   return b;
 }
 
 /* ==============================
- * Pool Cleanup (TTL expiration)
+ * Connection Management
  * ============================== */
 
-static void pool_cleanup_expired(void) {
-  /* Must be called with pool_mutex held */
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
-  gint64 now = g_get_monotonic_time() / G_USEC_PER_SEC;
-
-  /* Build list of expired URIs (don't modify hash table while iterating) */
-  GPtrArray *expired = g_ptr_array_new();
-
-  GHashTableIter iter;
-  gpointer key, value;
-  g_hash_table_iter_init(&iter, file_pool);
-  while (g_hash_table_iter_next(&iter, &key, &value)) {
-    struct _openslide_http_file *f = value;
-    /* Only expire if ref_count is 1 (only pool holds reference) */
-    if (g_atomic_int_get(&f->ref_count) == 1 &&
-        now - f->last_access > cfg->pool_ttl_sec) {
-      g_ptr_array_add(expired, g_strdup(key));
-    }
-  }
-
-  /* Remove expired entries */
-  for (guint i = 0; i < expired->len; i++) {
-    const gchar *uri = g_ptr_array_index(expired, i);
-    struct _openslide_http_file *f = g_hash_table_lookup(file_pool, uri);
-    if (f && g_atomic_int_get(&f->ref_count) == 1) {
-      g_hash_table_remove(file_pool, uri);
-      /* Actual cleanup happens when ref drops to 0 */
-    }
-  }
-
-  g_ptr_array_free(expired, TRUE);
-}
-
-/* ==============================
- * File Operations
- * ============================== */
-
-static void http_file_destroy(struct _openslide_http_file *f) {
-  if (!f) {
+static void http_connection_destroy(HttpConnection *conn) {
+  if (!conn) {
     return;
   }
 
-  /* Free all cached blocks */
-  if (f->block_map) {
+  if (conn->block_map) {
     GHashTableIter iter;
     gpointer key, value;
-    g_hash_table_iter_init(&iter, f->block_map);
+    g_hash_table_iter_init(&iter, conn->block_map);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
       HttpBlock *b = value;
       g_free(b->data);
       g_free(b);
     }
-    g_hash_table_destroy(f->block_map);
+    g_hash_table_destroy(conn->block_map);
   }
 
-  g_list_free(f->lru_list);
-  g_free(f->uri);
-
-  if (f->curl) {
-    curl_easy_cleanup(f->curl);
-  }
-
-  g_mutex_clear(&f->mutex);
-  g_free(f);
+  g_list_free(conn->lru_list);
+  g_free(conn->uri);
+  g_mutex_clear(&conn->mutex);
+  g_free(conn);
 }
 
-struct _openslide_http_file *_openslide_http_open(const char *uri,
-                                                   GError **err) {
+static void http_connection_unref(HttpConnection *conn) {
+  if (!conn) {
+    return;
+  }
+
+  if (g_atomic_int_dec_and_test(&conn->ref_count)) {
+    ensure_pool_mutex_init();
+    g_mutex_lock(&pool_mutex);
+    if (conn_pool) {
+      g_hash_table_remove(conn_pool, conn->uri);
+    }
+    g_mutex_unlock(&pool_mutex);
+    http_connection_destroy(conn);
+  }
+}
+
+static HttpConnection *http_connection_get_or_create(const char *uri,
+                                                      GError **err) {
   _openslide_http_init();
 
   const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
 
   g_mutex_lock(&pool_mutex);
 
-  /* Cleanup expired entries */
-  pool_cleanup_expired();
-
-  /* Check if already in pool - but create a NEW file handle with its own
-     position. The pool stores connection info (URL, size) and cached blocks,
-     but each caller gets an independent position (like reference impl).
-     
-     Actually, the current design shares position which is WRONG. Each
-     open should return a handle with position=0. For now, we reset position
-     when reusing from pool. A better design would be to separate the
-     "connection/cache" from "file handle with position". */
-  struct _openslide_http_file *f = g_hash_table_lookup(file_pool, uri);
-  if (f) {
-    g_atomic_int_inc(&f->ref_count);
-    f->last_access = g_get_monotonic_time() / G_USEC_PER_SEC;
-    /* CRITICAL: Reset position to 0 for new open - each caller expects
-       to start reading from the beginning of the file */
-    g_mutex_lock(&f->mutex);
-    f->position = 0;
-    g_mutex_unlock(&f->mutex);
+  HttpConnection *conn = g_hash_table_lookup(conn_pool, uri);
+  if (conn) {
+    g_atomic_int_inc(&conn->ref_count);
+    conn->last_access = g_get_monotonic_time() / G_USEC_PER_SEC;
     g_mutex_unlock(&pool_mutex);
-    return f;
+    return conn;
   }
 
-  /* Create new CURL handle */
+  /* Get file size with HEAD request */
   CURL *curl = curl_easy_init();
   if (!curl) {
     g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
@@ -582,11 +516,11 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
     return NULL;
   }
 
-  /* Get file size with HEAD request */
   curl_easy_setopt(curl, CURLOPT_URL, uri);
   curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "OpenSlide/4.0 libcurl");
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
                    (long)cfg->connect_timeout_ms);
   if (curl_share) {
@@ -613,37 +547,50 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
     return NULL;
   }
 
-  /* Use CURLINFO_CONTENT_LENGTH_DOWNLOAD (double) for compatibility with
-     older libcurl versions. CURLINFO_CONTENT_LENGTH_DOWNLOAD_T requires
-     libcurl >= 7.55.0 */
   double cl_double = -1;
   curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &cl_double);
+  curl_easy_cleanup(curl);
+
   if (cl_double <= 0) {
     g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                 "Cannot determine file size for %s", uri);
-    curl_easy_cleanup(curl);
     g_mutex_unlock(&pool_mutex);
     return NULL;
   }
 
-  /* Create file handle */
-  f = g_new0(struct _openslide_http_file, 1);
-  f->uri = g_strdup(uri);
-  f->curl = curl;
-  f->file_size = (uint64_t)cl_double;
-  f->position = 0;
-  f->block_map = g_hash_table_new(g_direct_hash, g_direct_equal);
-  f->lru_list = NULL;
-  f->cache_count = 0;
-  f->ref_count = 1;
-  f->last_access = g_get_monotonic_time() / G_USEC_PER_SEC;
-  g_mutex_init(&f->mutex);
+  conn = g_new0(HttpConnection, 1);
+  conn->uri = g_strdup(uri);
+  conn->file_size = (uint64_t)cl_double;
+  conn->block_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+  conn->lru_list = NULL;
+  conn->cache_count = 0;
+  conn->ref_count = 1;
+  conn->last_access = g_get_monotonic_time() / G_USEC_PER_SEC;
+  g_mutex_init(&conn->mutex);
 
-  /* Add to pool */
-  g_hash_table_insert(file_pool, g_strdup(uri), f);
+  g_hash_table_insert(conn_pool, g_strdup(uri), conn);
 
   g_mutex_unlock(&pool_mutex);
-  return f;
+  return conn;
+}
+
+/* ==============================
+ * File Handle Operations
+ * ============================== */
+
+struct _openslide_http_file *_openslide_http_open(const char *uri,
+                                                   GError **err) {
+  HttpConnection *conn = http_connection_get_or_create(uri, err);
+  if (!conn) {
+    return NULL;
+  }
+
+  /* Create new file handle with its own position */
+  struct _openslide_http_file *file = g_new0(struct _openslide_http_file, 1);
+  file->conn = conn;
+  file->position = 0;
+
+  return file;
 }
 
 size_t _openslide_http_read(struct _openslide_http_file *file,
@@ -652,19 +599,17 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
     return 0;
   }
 
+  HttpConnection *conn = file->conn;
   uint8_t *dst = (uint8_t *)buf;
   const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
 
-  g_mutex_lock(&file->mutex);
   int64_t pos = file->position;
-  uint64_t file_size = file->file_size;
-  g_mutex_unlock(&file->mutex);
+  uint64_t file_size = conn->file_size;
 
   if ((uint64_t)pos >= file_size) {
-    return 0;  /* EOF */
+    return 0;
   }
 
-  /* Clamp to available data */
   uint64_t avail = file_size - (uint64_t)pos;
   size_t to_read = MIN(size, (size_t)avail);
   size_t total = 0;
@@ -673,13 +618,13 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
     guint64 block_idx = (uint64_t)(pos + (int64_t)total) / cfg->block_size;
     uint32_t block_off = (uint64_t)(pos + (int64_t)total) % cfg->block_size;
 
-    HttpBlock *b = http_get_block(file, block_idx, err);
+    HttpBlock *b = http_get_block(conn, block_idx, err);
     if (!b) {
       break;
     }
 
     if (block_off >= b->len) {
-      break;  /* Shouldn't happen, but be safe */
+      break;
     }
 
     size_t block_avail = b->len - block_off;
@@ -689,11 +634,7 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
     total += copy_len;
   }
 
-  /* Update position */
-  g_mutex_lock(&file->mutex);
   file->position += (int64_t)total;
-  file->last_access = g_get_monotonic_time() / G_USEC_PER_SEC;
-  g_mutex_unlock(&file->mutex);
 
   return total;
 }
@@ -710,7 +651,7 @@ bool _openslide_http_read_exact(struct _openslide_http_file *file,
   if (count < size) {
     g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                 "Short read from %s: %" PRIu64 " < %" PRIu64,
-                file->uri, (uint64_t)count, (uint64_t)size);
+                file->conn->uri, (uint64_t)count, (uint64_t)size);
     return false;
   }
   return true;
@@ -724,8 +665,6 @@ bool _openslide_http_seek(struct _openslide_http_file *file,
     return false;
   }
 
-  g_mutex_lock(&file->mutex);
-
   int64_t new_pos;
   switch (whence) {
     case SEEK_SET:
@@ -735,24 +674,21 @@ bool _openslide_http_seek(struct _openslide_http_file *file,
       new_pos = file->position + offset;
       break;
     case SEEK_END:
-      new_pos = (int64_t)file->file_size + offset;
+      new_pos = (int64_t)file->conn->file_size + offset;
       break;
     default:
-      g_mutex_unlock(&file->mutex);
       g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                   "Invalid whence value: %d", whence);
       return false;
   }
 
   if (new_pos < 0) {
-    g_mutex_unlock(&file->mutex);
     g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
                 "Seek to negative position: %" PRId64, new_pos);
     return false;
   }
 
   file->position = new_pos;
-  g_mutex_unlock(&file->mutex);
   return true;
 }
 
@@ -761,12 +697,7 @@ int64_t _openslide_http_tell(struct _openslide_http_file *file,
   if (!file) {
     return -1;
   }
-
-  g_mutex_lock(&file->mutex);
-  int64_t pos = file->position;
-  g_mutex_unlock(&file->mutex);
-
-  return pos;
+  return file->position;
 }
 
 int64_t _openslide_http_size(struct _openslide_http_file *file,
@@ -774,7 +705,7 @@ int64_t _openslide_http_size(struct _openslide_http_file *file,
   if (!file) {
     return -1;
   }
-  return (int64_t)file->file_size;
+  return (int64_t)file->conn->file_size;
 }
 
 void _openslide_http_close(struct _openslide_http_file *file) {
@@ -782,19 +713,13 @@ void _openslide_http_close(struct _openslide_http_file *file) {
     return;
   }
 
-  ensure_pool_mutex_init();
+  http_connection_unref(file->conn);
+  g_free(file);
+}
 
-  g_mutex_lock(&pool_mutex);
-
-  if (g_atomic_int_dec_and_test(&file->ref_count)) {
-    /* Last reference - remove from pool and destroy */
-    if (file_pool) {
-      g_hash_table_remove(file_pool, file->uri);
-    }
-    g_mutex_unlock(&pool_mutex);
-    http_file_destroy(file);
-  } else {
-    /* Still has references */
-    g_mutex_unlock(&pool_mutex);
+const char *_openslide_http_get_uri(struct _openslide_http_file *file) {
+  if (!file || !file->conn) {
+    return NULL;
   }
+  return file->conn->uri;
 }
