@@ -730,7 +730,30 @@ static void http_connection_unref(HttpConnection *conn) {
   }
 }
 
-/* Fetch file size using first Range request (avoids separate HEAD) */
+/* Header callback to capture Content-Range */
+typedef struct {
+  uint64_t total_size;
+  gboolean found;
+} HeaderCtx;
+
+static size_t header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
+  HeaderCtx *ctx = (HeaderCtx *)userdata;
+  size_t total = size * nitems;
+  
+  /* Parse Content-Range: bytes 0-0/12345678 */
+  if (g_ascii_strncasecmp(buffer, "Content-Range:", 14) == 0) {
+    char *slash = strchr(buffer, '/');
+    if (slash && slash[1] != '*') {
+      ctx->total_size = (uint64_t)g_ascii_strtoull(slash + 1, NULL, 10);
+      if (ctx->total_size > 0) {
+        ctx->found = TRUE;
+      }
+    }
+  }
+  return total;
+}
+
+/* Fetch file size - tries HEAD first, then Range fallback */
 static bool http_get_file_size(const char *uri, uint64_t *out_size, GError **err) {
   CURL *curl = curl_easy_init();
   if (!curl) {
@@ -739,63 +762,53 @@ static bool http_get_file_size(const char *uri, uint64_t *out_size, GError **err
     return false;
   }
 
+  /* Method 1: HEAD request (fastest, most servers support) */
   http_curl_setup_common(curl, uri);
+  curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
   
-  /* Use Range: bytes=0-0 to get Content-Range header */
-  struct curl_slist *headers = curl_slist_append(NULL, "Range: bytes=0-0");
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
-  
-  /* Discard body */
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_discard_callback);
-
   CURLcode code = curl_easy_perform(curl);
-  
   long http_code = 0;
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-  bool success = false;
   
-  if (code == CURLE_OK && http_code == 206) {
-    /* Parse Content-Range: bytes 0-0/12345 */
-    double cl = 0;
-    curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &cl);
-    
-    /* Try to get from header */
-    char *content_range = NULL;
-    curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &content_range);
-    
-    /* Fallback: try HEAD */
-    curl_easy_reset(curl);
-    http_curl_setup_common(curl, uri);
-    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-    code = curl_easy_perform(curl);
-    
-    if (code == CURLE_OK) {
-      curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &cl);
-      if (cl > 0) {
-        *out_size = (uint64_t)cl;
-        success = true;
-      }
-    }
-  } else if (code == CURLE_OK && http_code == 200) {
-    /* Server doesn't support Range, get full size */
+  if (code == CURLE_OK && (http_code == 200 || http_code == 206)) {
     double cl = 0;
     curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &cl);
     if (cl > 0) {
       *out_size = (uint64_t)cl;
-      success = true;
+      curl_easy_cleanup(curl);
+      HTTP_LOG("[HTTP-SIZE] HEAD success: %s size=%" PRIu64 "\n", uri, *out_size);
+      return true;
     }
   }
-
+  
+  /* Method 2: Range request with header parsing (fallback for servers that don't support HEAD) */
+  curl_easy_reset(curl);
+  http_curl_setup_common(curl, uri);
+  
+  struct curl_slist *headers = curl_slist_append(NULL, "Range: bytes=0-0");
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_discard_callback);
+  
+  HeaderCtx hctx = {0, FALSE};
+  curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
+  curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hctx);
+  
+  code = curl_easy_perform(curl);
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
-
-  if (!success) {
-    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
-                "Failed to get file size for %s", uri);
+  
+  if (code == CURLE_OK && http_code == 206 && hctx.found) {
+    *out_size = hctx.total_size;
+    HTTP_LOG("[HTTP-SIZE] Range fallback success: %s size=%" PRIu64 "\n", uri, *out_size);
+    return true;
   }
-  return success;
+  
+  g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+              "Failed to get file size for %s (HEAD http=%ld, Range http=%ld)", 
+              uri, http_code, http_code);
+  return false;
 }
 
 static HttpConnection *http_connection_create(const char *uri, GError **err) {
