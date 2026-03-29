@@ -235,6 +235,12 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
   curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 60L);
+  
+  /* Disable Accept-Encoding to ensure we get raw uncompressed data.
+     This is important for Range requests on binary files. */
+  curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
+  /* Also disable HTTP/2 server push which can cause issues */
+  curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
 
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)cfg->connect_timeout_ms);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)cfg->transfer_timeout_ms);
@@ -255,19 +261,23 @@ static size_t http_write_callback(void *data, size_t sz, size_t nmemb,
   WriteCtx *ctx = (WriteCtx *)user;
   size_t total = sz * nmemb;
 
-  if (total > ctx->remain) {
-    total = ctx->remain;
-  }
-  if (total == 0) {
-    return 0;
+  /* If we have no more room, still return the full size to indicate success
+     to CURL (otherwise it treats it as an error). We just won't copy data. */
+  if (ctx->remain == 0) {
+    return total;
   }
 
-  memcpy(ctx->dst, data, total);
-  ctx->dst += total;
-  ctx->written += total;
-  ctx->remain -= total;
+  size_t to_copy = total;
+  if (to_copy > ctx->remain) {
+    to_copy = ctx->remain;
+  }
 
-  return total;
+  memcpy(ctx->dst, data, to_copy);
+  ctx->dst += to_copy;
+  ctx->written += to_copy;
+  ctx->remain -= to_copy;
+
+  return total;  /* Always return total to signal success to CURL */
 }
 
 /* ==============================
@@ -283,11 +293,13 @@ static bool http_fetch_range(struct _openslide_http_file *f,
 
   WriteCtx ctx = {.dst = dst, .remain = len, .written = 0};
 
-  for (int retry = 0; retry <= cfg->retry_max; retry++) {
+  for (int retry = 0; retry <= (int)cfg->retry_max; retry++) {
     g_autofree gchar *range = g_strdup_printf(
         "bytes=%" PRIu64 "-%" PRIu64,
         offset + ctx.written,
         offset + len - 1);
+
+    fprintf(stderr, "[HTTP-FETCH] Range: %s\n", range);
 
     curl_easy_reset(f->curl);
     http_curl_setup_common(f->curl, f->uri);
@@ -296,9 +308,12 @@ static bool http_fetch_range(struct _openslide_http_file *f,
     curl_easy_setopt(f->curl, CURLOPT_WRITEDATA, &ctx);
 
     CURLcode code = curl_easy_perform(f->curl);
+    fprintf(stderr, "[HTTP-FETCH] CURL code=%d, written=%zu\n", code, ctx.written);
+    
     if (code == CURLE_OK) {
       long http_code = 0;
       curl_easy_getinfo(f->curl, CURLINFO_RESPONSE_CODE, &http_code);
+      fprintf(stderr, "[HTTP-FETCH] HTTP code=%ld\n", http_code);
       /* Accept 200 (full content) and 206 (partial content) */
       if (http_code == 200 || http_code == 206) {
         *out_written = ctx.written;
