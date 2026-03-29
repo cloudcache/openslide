@@ -553,11 +553,23 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
   /* Cleanup expired entries */
   pool_cleanup_expired();
 
-  /* Check if already in pool */
+  /* Check if already in pool - but create a NEW file handle with its own
+     position. The pool stores connection info (URL, size) and cached blocks,
+     but each caller gets an independent position (like reference impl).
+     
+     Actually, the current design shares position which is WRONG. Each
+     open should return a handle with position=0. For now, we reset position
+     when reusing from pool. A better design would be to separate the
+     "connection/cache" from "file handle with position". */
   struct _openslide_http_file *f = g_hash_table_lookup(file_pool, uri);
   if (f) {
     g_atomic_int_inc(&f->ref_count);
     f->last_access = g_get_monotonic_time() / G_USEC_PER_SEC;
+    /* CRITICAL: Reset position to 0 for new open - each caller expects
+       to start reading from the beginning of the file */
+    g_mutex_lock(&f->mutex);
+    f->position = 0;
+    g_mutex_unlock(&f->mutex);
     g_mutex_unlock(&pool_mutex);
     return f;
   }
