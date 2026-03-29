@@ -374,10 +374,12 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
   curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 0L);
   curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
   
-  /* Try HTTP/2 for multiplexing if available */
+  /* Try HTTP/2 for multiplexing if available (libcurl >= 7.33.0) */
+#ifdef CURL_HTTP_VERSION_2_0
   curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+#endif
   
-  /* Enable TCP Fast Open if supported */
+  /* Enable TCP Fast Open if supported (libcurl >= 7.49.0) */
 #ifdef CURLOPT_TCP_FASTOPEN
   curl_easy_setopt(curl, CURLOPT_TCP_FASTOPEN, 1L);
 #endif
