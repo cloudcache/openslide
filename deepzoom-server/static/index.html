@@ -72,20 +72,38 @@
     </header>
 
     <!-- Path Input Bar -->
-    <div class="border-b border-border px-6 py-3 flex gap-4">
-        <div class="flex-1 flex gap-2">
-            <label class="text-sm text-muted-foreground self-center w-16">Local:</label>
-            <input type="text" id="localPath" placeholder="/path/to/local/slide.svs"
-                class="flex-1 bg-muted border border-border rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary">
+    <div class="border-b border-border px-6 py-3 space-y-3">
+        <div class="flex gap-4">
+            <div class="flex-1 flex gap-2">
+                <label class="text-sm text-muted-foreground self-center w-16">Local:</label>
+                <input type="text" id="localPath" placeholder="/path/to/local/slide.svs"
+                    class="flex-1 bg-muted border border-border rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary">
+            </div>
+            <div class="flex-1 flex gap-2">
+                <label class="text-sm text-muted-foreground self-center w-16">Remote:</label>
+                <input type="text" id="remotePath" placeholder="https://example.com/slide.svs"
+                    class="flex-1 bg-muted border border-border rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary">
+            </div>
+            <button id="loadBtn" class="px-4 py-1.5 bg-primary text-primary-foreground rounded text-sm hover:bg-primary/90 transition">
+                Load
+            </button>
         </div>
-        <div class="flex-1 flex gap-2">
-            <label class="text-sm text-muted-foreground self-center w-16">Remote:</label>
-            <input type="text" id="remotePath" placeholder="https://example.com/slide.svs"
-                class="flex-1 bg-muted border border-border rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary">
+        <!-- Quick Examples -->
+        <div class="flex items-center gap-2 text-xs">
+            <span class="text-muted-foreground">Examples:</span>
+            <button class="example-btn px-2 py-1 bg-muted hover:bg-accent rounded transition"
+                data-local="" data-remote="https://storage.googleapis.com/imagebox_test/openslide-testdata/Aperio/CMU-1.svs">
+                GCS CMU-1
+            </button>
+            <button class="example-btn px-2 py-1 bg-muted hover:bg-accent rounded transition"
+                data-local="" data-remote="https://storage.googleapis.com/imagebox_test/openslide-testdata/Aperio/CMU-2.svs">
+                GCS CMU-2
+            </button>
+            <button class="example-btn px-2 py-1 bg-muted hover:bg-accent rounded transition"
+                data-local="" data-remote="https://storage.googleapis.com/imagebox_test/openslide-testdata/Hamamatsu/CMU-1.ndpi">
+                GCS NDPI
+            </button>
         </div>
-        <button id="loadBtn" class="px-4 py-1.5 bg-primary text-primary-foreground rounded text-sm hover:bg-primary/90 transition">
-            Load
-        </button>
     </div>
 
     <!-- Main Viewer Area -->

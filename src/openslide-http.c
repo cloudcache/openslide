@@ -236,6 +236,9 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 60L);
   
+  /* Set a proper User-Agent - some servers require this */
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "OpenSlide/4.0 libcurl");
+  
   /* Do NOT set CURLOPT_ACCEPT_ENCODING for Range requests.
      Setting it to "" causes CURL to send "Accept-Encoding: gzip, deflate",
      which makes many servers (including GCS) ignore the Range header and
@@ -310,8 +313,6 @@ static bool http_fetch_range(struct _openslide_http_file *f,
              offset + ctx.written,
              offset + len - 1);
 
-    fprintf(stderr, "[HTTP-FETCH] %s\n", range_header);
-
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, range_header);
 
@@ -321,12 +322,10 @@ static bool http_fetch_range(struct _openslide_http_file *f,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
 
     CURLcode code = curl_easy_perform(curl);
-    fprintf(stderr, "[HTTP-FETCH] CURL code=%d, written=%zu\n", code, ctx.written);
 
     long http_code = 0;
     if (code == CURLE_OK) {
       curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-      fprintf(stderr, "[HTTP-FETCH] HTTP code=%ld\n", http_code);
     }
 
     curl_slist_free_all(headers);
