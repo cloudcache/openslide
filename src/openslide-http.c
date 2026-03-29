@@ -91,14 +91,14 @@ static GMutex config_mutex;
 static gboolean config_mutex_initialized = FALSE;
 
 static OpenslideHTTPConfig http_config = {
-  .block_size = 64 * 1024,         /* 64KB blocks - match typical TIFF tile size */
-  .max_cache_blocks = 512,         /* 32MB max cache */
+  .block_size = 1024 * 1024,       /* 1MB blocks - optimize for object storage (high latency, high bandwidth) */
+  .max_cache_blocks = 64,          /* 64MB max cache */
   .retry_max = 3,
   .retry_delay_ms = 100,
   .connect_timeout_ms = 10000,
-  .transfer_timeout_ms = 30000,
+  .transfer_timeout_ms = 60000,    /* 60s for large blocks */
   .low_speed_limit = 1024,
-  .low_speed_time = 10,
+  .low_speed_time = 30,
   .pool_ttl_sec = 300,
 };
 
