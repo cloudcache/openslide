@@ -659,14 +659,31 @@ static bool async_assign_job_to_slot(AsyncEasySlot *slot, HttpRequestJob *job, G
     return false;
   }
 
-  curl_easy_reset(slot->easy);
-  http_curl_setup_common(slot->easy, job->conn->uri);
-  curl_easy_setopt(slot->easy, CURLOPT_HTTPHEADER, slot->headers);
-  curl_easy_setopt(slot->easy, CURLOPT_WRITEFUNCTION, http_write_callback);
-  curl_easy_setopt(slot->easy, CURLOPT_WRITEDATA, &job->write_ctx);
-  curl_easy_setopt(slot->easy, CURLOPT_HEADERFUNCTION, header_callback);
-  curl_easy_setopt(slot->easy, CURLOPT_HEADERDATA, &job->header_ctx);
-  curl_easy_setopt(slot->easy, CURLOPT_PRIVATE, slot);
+  CURL *easy = slot->easy;
+  
+  /* CRITICAL: Do NOT call curl_easy_reset() - it breaks connection reuse!
+   * Instead, only update the options that change between requests. */
+  
+  /* Only do full setup on first use */
+  if (!slot->ever_used) {
+    http_curl_setup_common(easy, job->conn->uri);
+  } else {
+    /* For reused handles, only update URL if it changed */
+    curl_easy_setopt(easy, CURLOPT_URL, job->conn->uri);
+  }
+  
+  /* Update per-request options */
+  curl_easy_setopt(easy, CURLOPT_HTTPHEADER, slot->headers);
+  curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, http_write_callback);
+  curl_easy_setopt(easy, CURLOPT_WRITEDATA, &job->write_ctx);
+  curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, header_callback);
+  curl_easy_setopt(easy, CURLOPT_HEADERDATA, &job->header_ctx);
+  curl_easy_setopt(easy, CURLOPT_PRIVATE, slot);
+  
+  /* Enable HTTP/2 multiplexing wait - this is crucial for connection reuse */
+#ifdef CURLOPT_PIPEWAIT
+  curl_easy_setopt(easy, CURLOPT_PIPEWAIT, 1L);
+#endif
 
   job->was_reused = slot->ever_used;
   slot->job = job;
@@ -886,14 +903,32 @@ static void async_downloader_init(void) {
       curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
 #endif
 #endif
+      /* CRITICAL for connection reuse: Limit connections per host to 1-2
+       * This forces HTTP/2 multiplexing on a single TCP connection */
 #ifdef CURLMOPT_MAX_HOST_CONNECTIONS
-      curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_MAX_HOST_CONNECTIONS, HTTP_ASYNC_SLOTS);
+      curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_MAX_HOST_CONNECTIONS, 2L);
 #endif
 #ifdef CURLMOPT_MAX_TOTAL_CONNECTIONS
-      curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_MAX_TOTAL_CONNECTIONS, HTTP_ASYNC_SLOTS * 4L);
+      curl_multi_setopt(g_downloader.multi_handle, CURLMOPT_MAX_TOTAL_CONNECTIONS, 4L);
 #endif
       for (int i = 0; i < HTTP_ASYNC_SLOTS; i++) {
-        g_downloader.slots[i].easy = curl_easy_init();
+        CURL *easy = curl_easy_init();
+        if (easy) {
+          /* Pre-configure for connection reuse and HTTP/2 */
+          curl_easy_setopt(easy, CURLOPT_TCP_KEEPALIVE, 1L);
+          curl_easy_setopt(easy, CURLOPT_FORBID_REUSE, 0L);
+          curl_easy_setopt(easy, CURLOPT_FRESH_CONNECT, 0L);
+#ifdef CURL_HTTP_VERSION_2_0
+          curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+#endif
+#ifdef CURLOPT_PIPEWAIT
+          curl_easy_setopt(easy, CURLOPT_PIPEWAIT, 1L);
+#endif
+          if (curl_share) {
+            curl_easy_setopt(easy, CURLOPT_SHARE, curl_share);
+          }
+        }
+        g_downloader.slots[i].easy = easy;
         g_downloader.slots[i].job = NULL;
         g_downloader.slots[i].headers = NULL;
         g_downloader.slots[i].busy = FALSE;
