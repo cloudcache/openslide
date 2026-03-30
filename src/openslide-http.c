@@ -151,15 +151,6 @@ typedef struct {
   GCond fetch_cond;      /* Condition variable for in-flight waiting */
 } HttpBlock;
 
-/* CURL handle pool entry */
-typedef struct {
-  CURL *curl;
-  gboolean in_use;
-  gint64 last_used;
-} CurlHandle;
-
-#define MAX_CURL_HANDLES 16
-
 /* Connection state */
 typedef enum {
   CONN_STATE_INIT = 0,
@@ -188,10 +179,6 @@ typedef struct _http_connection {
   LruNode *lru_tail;      /* Least recently used */
   guint cache_count;
   GMutex cache_mutex;     /* Separate lock for cache only */
-
-  /* CURL handle pool */
-  CurlHandle curl_pool[MAX_CURL_HANDLES];
-  GMutex curl_mutex;
 
   gint ref_count;
   gint64 last_used_us;    /* Last time this pooled connection was borrowed/released */
@@ -357,69 +344,6 @@ void _openslide_http_cleanup(void) {
     return;
   }
   g_mutex_unlock(&pool_mutex);
-}
-
-/* ==============================
- * CURL Handle Pool Management
- * ============================== */
-
-static CURL *curl_pool_acquire(HttpConnection *conn, gboolean *was_reused) {
-  g_mutex_lock(&conn->curl_mutex);
-
-  *was_reused = FALSE;
-  gint64 now = g_get_monotonic_time();
-
-  /* Try to find an idle handle */
-  for (int i = 0; i < MAX_CURL_HANDLES; i++) {
-    if (conn->curl_pool[i].curl && !conn->curl_pool[i].in_use) {
-      conn->curl_pool[i].in_use = TRUE;
-      conn->curl_pool[i].last_used = now;
-      *was_reused = TRUE;
-      g_mutex_unlock(&conn->curl_mutex);
-      return conn->curl_pool[i].curl;
-    }
-  }
-
-  /* Create new handle in empty slot */
-  for (int i = 0; i < MAX_CURL_HANDLES; i++) {
-    if (!conn->curl_pool[i].curl) {
-      CURL *curl = curl_easy_init();
-      if (curl) {
-        /* CRITICAL: Setup connection reuse options on new handle */
-        http_curl_setup_common(curl, conn->uri);
-        conn->curl_pool[i].curl = curl;
-        conn->curl_pool[i].in_use = TRUE;
-        conn->curl_pool[i].last_used = now;
-        g_mutex_unlock(&conn->curl_mutex);
-        return curl;
-      }
-    }
-  }
-
-  g_mutex_unlock(&conn->curl_mutex);
-  
-  /* Temporary handle - also needs setup */
-  CURL *curl = curl_easy_init();
-  if (curl) {
-    http_curl_setup_common(curl, conn->uri);
-  }
-  return curl;
-}
-
-static void curl_pool_release(HttpConnection *conn, CURL *curl) {
-  g_mutex_lock(&conn->curl_mutex);
-
-  for (int i = 0; i < MAX_CURL_HANDLES; i++) {
-    if (conn->curl_pool[i].curl == curl) {
-      conn->curl_pool[i].in_use = FALSE;
-      conn->curl_pool[i].last_used = g_get_monotonic_time();
-      g_mutex_unlock(&conn->curl_mutex);
-      return;
-    }
-  }
-
-  g_mutex_unlock(&conn->curl_mutex);
-  curl_easy_cleanup(curl);
 }
 
 /* ==============================
@@ -593,6 +517,12 @@ typedef struct {
   gboolean initialized;
   gboolean stop;
   AsyncEasySlot slots[HTTP_ASYNC_SLOTS];
+
+  /* Transport metrics - for debugging connection reuse */
+  volatile gint total_requests;       /* Total HTTP requests issued */
+  volatile gint reused_connections;   /* Requests that reused an existing connection */
+  volatile gint new_connections;      /* Requests that opened a new TCP connection */
+  volatile gint http2_streams;        /* HTTP/2 multiplexed streams */
 } AsyncDownloader;
 
 static AsyncDownloader g_downloader = {0};
@@ -927,6 +857,23 @@ static void async_handle_completed_jobs(void) {
 
     long http_code = 0;
     curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+    /* Track connection reuse metrics */
+    long num_connects = 0;
+    curl_easy_getinfo(msg->easy_handle, CURLINFO_NUM_CONNECTS, &num_connects);
+    g_atomic_int_add(&g_downloader.total_requests, 1);
+    if (num_connects == 0) {
+      g_atomic_int_add(&g_downloader.reused_connections, 1);
+    } else {
+      g_atomic_int_add(&g_downloader.new_connections, 1);
+    }
+#ifdef CURLINFO_HTTP_VERSION
+    long http_version = 0;
+    curl_easy_getinfo(msg->easy_handle, CURLINFO_HTTP_VERSION, &http_version);
+    if (http_version >= CURL_HTTP_VERSION_2) {
+      g_atomic_int_add(&g_downloader.http2_streams, 1);
+    }
+#endif
 
     curl_multi_remove_handle(g_downloader.multi_handle, msg->easy_handle);
 
@@ -1902,16 +1849,6 @@ static void http_connection_destroy(HttpConnection *conn) {
     return;
   }
 
-  /* Free CURL handles */
-  g_mutex_lock(&conn->curl_mutex);
-  for (int i = 0; i < MAX_CURL_HANDLES; i++) {
-    if (conn->curl_pool[i].curl) {
-      curl_easy_cleanup(conn->curl_pool[i].curl);
-      conn->curl_pool[i].curl = NULL;
-    }
-  }
-  g_mutex_unlock(&conn->curl_mutex);
-
   /* Free cache */
   g_mutex_lock(&conn->cache_mutex);
   if (conn->block_map) {
@@ -1935,7 +1872,6 @@ static void http_connection_destroy(HttpConnection *conn) {
   conn->uri = NULL;
   g_mutex_clear(&conn->mutex);
   g_mutex_clear(&conn->cache_mutex);
-  g_mutex_clear(&conn->curl_mutex);
   g_cond_clear(&conn->state_cond);
   g_free(conn);
 }
@@ -2056,7 +1992,6 @@ static HttpConnection *http_connection_create(const char *uri, GError **err G_GN
   
   g_mutex_init(&conn->mutex);
   g_mutex_init(&conn->cache_mutex);
-  g_mutex_init(&conn->curl_mutex);
   g_cond_init(&conn->state_cond);
   
   conn->block_map = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -2439,14 +2374,26 @@ bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
  * ============================== */
 
 void _openslide_http_print_stats(void) {
+  /* Transport metrics - always available for debugging connection reuse */
+  gint total = g_atomic_int_get(&g_downloader.total_requests);
+  gint reused = g_atomic_int_get(&g_downloader.reused_connections);
+  gint newconn = g_atomic_int_get(&g_downloader.new_connections);
+  gint h2 = g_atomic_int_get(&g_downloader.http2_streams);
+
+  fprintf(stderr, "[HTTP-TRANSPORT] total_requests=%d new_tcp_connections=%d reused_connections=%d reuse_rate=%.1f%%\n",
+          total, newconn, reused,
+          total > 0 ? 100.0 * reused / total : 0.0);
+  fprintf(stderr, "[HTTP-TRANSPORT] http2_streams=%d http2_rate=%.1f%%\n",
+          h2, total > 0 ? 100.0 * h2 / total : 0.0);
+
 #if HTTP_STATS
   gint reqs = g_atomic_int_get(&global_stats.total_requests);
   gint bytes_kb = g_atomic_int_get(&global_stats.total_bytes_kb);
   gint time_ms = g_atomic_int_get(&global_stats.total_time_ms);
   gint hits = g_atomic_int_get(&global_stats.cache_hits);
   gint misses = g_atomic_int_get(&global_stats.cache_misses);
-  gint reused = g_atomic_int_get(&global_stats.connection_reuses);
-  gint newconn = g_atomic_int_get(&global_stats.new_connections);
+  gint stat_reused = g_atomic_int_get(&global_stats.connection_reuses);
+  gint stat_newconn = g_atomic_int_get(&global_stats.new_connections);
 
   fprintf(stderr, "[HTTP-GLOBAL-STATS] requests=%d bytes=%dKB time=%dms avg=%.2fms/req\n",
           reqs, bytes_kb, time_ms, 
@@ -2455,9 +2402,7 @@ void _openslide_http_print_stats(void) {
           hits, misses, 
           (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0);
   fprintf(stderr, "[HTTP-GLOBAL-STATS] conn_reused=%d conn_new=%d reuse_rate=%.1f%%\n",
-          reused, newconn,
-          (reused + newconn) > 0 ? 100.0 * reused / (reused + newconn) : 0.0);
-#else
-  fprintf(stderr, "[HTTP-GLOBAL-STATS] Statistics disabled (HTTP_STATS=0)\n");
+          stat_reused, stat_newconn,
+          (stat_reused + stat_newconn) > 0 ? 100.0 * stat_reused / (stat_reused + stat_newconn) : 0.0);
 #endif
 }
