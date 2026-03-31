@@ -122,6 +122,9 @@ const OpenslideHTTPConfig *_openslide_http_get_config(void) {
 
 #define HTTP_FRONT_WINDOW_BYTES         (4 * 1024 * 1024)  /* Grab 4MB up front to collapse metadata chatter */
 #define HTTP_FRONT_WINDOW_MAX_BYTES     (8 * 1024 * 1024)  /* Allow metadata/DZI window to grow to 8MB */
+#define HTTP_TAIL_WINDOW_BYTES          (4 * 1024 * 1024)  /* Grab 4MB from file end for TIFF IFD tail reads */
+#define HTTP_TAIL_MAX_EXTENT_BYTES      (4 * 1024 * 1024)  /* 4MB extent cap for tail region reads */
+#define HTTP_TAIL_REGION_BYTES          (8 * 1024 * 1024)  /* "near end" = last 8MB of file */
 
 
 /* ==============================
@@ -180,6 +183,11 @@ typedef struct _http_connection {
   uint8_t *front_window_data;
   size_t front_window_len;
 
+  /* Tail window for TIFF IFD / strip-offset reads near end of file */
+  uint8_t *tail_window_data;
+  size_t   tail_window_len;
+  uint64_t tail_window_offset;   /* absolute file offset where tail data starts */
+
   ConnState state;
   GCond state_cond;      /* Wait for connection ready */
 
@@ -232,6 +240,10 @@ static CURLSH *curl_share = NULL;
 static gboolean http_initialized = FALSE;
 static gboolean pool_mutex_initialized = FALSE;
 
+/* Throttle expired-connection scans: run at most once per interval */
+#define HTTP_EXPIRED_SCAN_INTERVAL_US  (5 * G_USEC_PER_SEC)
+static gint64 last_expired_scan_us = 0;
+
 /* CURL share lock mutexes */
 static GMutex curl_lock_mutexes[CURL_LOCK_DATA_LAST];
 static gboolean curl_locks_initialized = FALSE;
@@ -280,6 +292,9 @@ static HttpBlock *http_get_block(HttpConnection *conn,
 static bool http_fill_front_window(HttpConnection *conn, size_t want_bytes, GError **err);
 static bool http_front_window_contains(HttpConnection *conn, uint64_t offset, size_t size);
 static bool http_front_window_view(HttpConnection *conn, uint64_t offset, const uint8_t **out_ptr, size_t *out_avail);
+static bool http_fill_tail_window(HttpConnection *conn, size_t want_bytes, GError **err);
+static bool http_tail_window_contains(HttpConnection *conn, uint64_t offset, size_t size);
+static bool http_tail_window_view(HttpConnection *conn, uint64_t offset, const uint8_t **out_ptr, size_t *out_avail);
 static void http_connection_destroy(HttpConnection *conn);
 static GList *http_pool_collect_expired_locked(void);
 static void http_destroy_connection_list(GList *list);
@@ -1367,6 +1382,84 @@ static bool http_fill_front_window(HttpConnection *conn, size_t want_bytes, GErr
   return true;
 }
 
+/* ---- Tail window: covers the last N bytes of the file ---- */
+
+static bool http_tail_window_contains(HttpConnection *conn, uint64_t offset, size_t size) {
+  if (size == 0) {
+    return true;
+  }
+  if (!conn->tail_window_data || conn->file_size == 0) {
+    return false;
+  }
+  return offset >= conn->tail_window_offset &&
+         offset + size <= conn->tail_window_offset + conn->tail_window_len;
+}
+
+static bool http_tail_window_view(HttpConnection *conn, uint64_t offset,
+                                  const uint8_t **out_ptr, size_t *out_avail) {
+  if (!http_tail_window_contains(conn, offset, 1)) {
+    return false;
+  }
+  size_t local_off = (size_t)(offset - conn->tail_window_offset);
+  *out_ptr = conn->tail_window_data + local_off;
+  *out_avail = conn->tail_window_len - local_off;
+  return true;
+}
+
+static bool http_fill_tail_window(HttpConnection *conn, size_t want_bytes, GError **err) {
+  if (conn->file_size == 0) {
+    return true;
+  }
+
+  size_t capped = MIN(want_bytes, (size_t) conn->file_size);
+  uint64_t tail_offset = conn->file_size - capped;
+
+  g_mutex_lock(&conn->cache_mutex);
+  /* Already have sufficient tail window */
+  if (conn->tail_window_data != NULL && conn->tail_window_len >= capped) {
+    g_mutex_unlock(&conn->cache_mutex);
+    return true;
+  }
+  /* Front window already covers entire file */
+  if (conn->front_window_data && conn->front_window_len >= conn->file_size) {
+    g_mutex_unlock(&conn->cache_mutex);
+    return true;
+  }
+  /* Don't overlap: if front window covers the tail region, skip */
+  if (conn->front_window_data && tail_offset < conn->front_window_len) {
+    tail_offset = conn->front_window_len;
+    if (tail_offset >= conn->file_size) {
+      g_mutex_unlock(&conn->cache_mutex);
+      return true;
+    }
+    capped = (size_t)(conn->file_size - tail_offset);
+  }
+  g_mutex_unlock(&conn->cache_mutex);
+
+  uint8_t *buffer = g_malloc(capped);
+  size_t written = 0;
+  if (!http_fetch_range(conn, tail_offset, capped, buffer, &written, NULL, err) ||
+      written == 0) {
+    g_free(buffer);
+    return false;
+  }
+
+  uint8_t *owned = g_realloc(buffer, written);
+
+  g_mutex_lock(&conn->cache_mutex);
+  if (written > conn->tail_window_len || conn->tail_window_data == NULL) {
+    g_free(conn->tail_window_data);
+    conn->tail_window_data = owned;
+    conn->tail_window_len = written;
+    conn->tail_window_offset = tail_offset;
+    owned = NULL;
+  }
+  g_mutex_unlock(&conn->cache_mutex);
+
+  g_free(owned);
+  return true;
+}
+
 static void http_block_free(HttpBlock *b) {
   if (!b) {
     return;
@@ -1432,6 +1525,14 @@ static guint64 extent_cap_end_block(HttpConnection *conn,
       if (metadata_end_block > target_end) {
         target_end = metadata_end_block;
       }
+    }
+  } else if (conn->file_size > 0 &&
+             start_offset + HTTP_TAIL_REGION_BYTES >= conn->file_size) {
+    /* Near end of file: allow larger extents to merge tail reads */
+    max_bytes = HTTP_TAIL_MAX_EXTENT_BYTES;
+    /* Extend target to end of file so tail reads merge into one request */
+    if (file_last_block > target_end) {
+      target_end = file_last_block;
     }
   }
 
@@ -1896,6 +1997,10 @@ static void http_connection_destroy(HttpConnection *conn) {
   g_free(conn->front_window_data);
   conn->front_window_data = NULL;
   conn->front_window_len = 0;
+  g_free(conn->tail_window_data);
+  conn->tail_window_data = NULL;
+  conn->tail_window_len = 0;
+  conn->tail_window_offset = 0;
   conn->lru_head = NULL;
   conn->lru_tail = NULL;
   g_mutex_unlock(&conn->cache_mutex);
@@ -2011,8 +2116,19 @@ static bool http_prime_connection(HttpConnection *conn, uint64_t *out_size, GErr
   *out_size = conn->file_size > 0 ? conn->file_size : conn->front_window_len;
   g_mutex_unlock(&conn->cache_mutex);
 
-  HTTP_LOG("[HTTP-PRIME] %s size=%" PRIu64 " front_window=%zuB\n",
-           conn->uri, *out_size, conn->front_window_len);
+  /* Prefetch tail window for TIFF IFD / strip-offset reads near end of file.
+   * This is opportunistic: failure does not block opening. */
+  if (*out_size > (uint64_t) HTTP_FRONT_WINDOW_BYTES) {
+    GError *tail_err = NULL;
+    if (!http_fill_tail_window(conn, HTTP_TAIL_WINDOW_BYTES, &tail_err)) {
+      HTTP_LOG("[HTTP-PRIME] tail prefetch failed: %s\n",
+               tail_err ? tail_err->message : "unknown");
+      g_clear_error(&tail_err);
+    }
+  }
+
+  HTTP_LOG("[HTTP-PRIME] %s size=%" PRIu64 " front_window=%zuB tail_window=%zuB\n",
+           conn->uri, *out_size, conn->front_window_len, conn->tail_window_len);
   return *out_size > 0;
 }
 
@@ -2035,13 +2151,43 @@ static HttpConnection *http_connection_create(const char *uri, GError **err G_GN
   return conn;
 }
 
+/* Fast path: pool hit with READY connection, no expired scan */
+static HttpConnection *http_connection_get_fast(const char *uri) {
+  if (!http_initialized || !conn_pool) {
+    return NULL;
+  }
+
+  g_mutex_lock(&pool_mutex);
+  HttpConnection *conn = g_hash_table_lookup(conn_pool, uri);
+  if (conn) {
+    g_mutex_lock(&conn->mutex);
+    if (conn->state == CONN_STATE_READY) {
+      conn->ref_count++;
+      conn->last_used_us = g_get_monotonic_time();
+      g_mutex_unlock(&conn->mutex);
+      g_mutex_unlock(&pool_mutex);
+      return conn;
+    }
+    g_mutex_unlock(&conn->mutex);
+  }
+  g_mutex_unlock(&pool_mutex);
+  return NULL;
+}
+
 static HttpConnection *http_connection_get_or_create(const char *uri, GError **err) {
   ensure_pool_mutex_init();
   _openslide_http_init();
 
   /* Quick check with pool lock */
   g_mutex_lock(&pool_mutex);
-  GList *expired = http_pool_collect_expired_locked();
+
+  /* Throttled expired scan: only run once per interval */
+  GList *expired = NULL;
+  gint64 now_us = g_get_monotonic_time();
+  if (now_us - last_expired_scan_us >= HTTP_EXPIRED_SCAN_INTERVAL_US) {
+    expired = http_pool_collect_expired_locked();
+    last_expired_scan_us = now_us;
+  }
   
   HttpConnection *conn = conn_pool ? g_hash_table_lookup(conn_pool, uri) : NULL;
   
@@ -2127,7 +2273,12 @@ static HttpConnection *http_connection_get_or_create(const char *uri, GError **e
 
 struct _openslide_http_file *_openslide_http_open(const char *uri,
                                                    GError **err) {
-  HttpConnection *conn = http_connection_get_or_create(uri, err);
+  /* Fast path: reuse existing READY connection without expired scan */
+  HttpConnection *conn = http_connection_get_fast(uri);
+  if (!conn) {
+    /* Slow path: full init + expired scan + create + prime */
+    conn = http_connection_get_or_create(uri, err);
+  }
   if (!conn) {
     return NULL;
   }
@@ -2242,6 +2393,7 @@ static bool http_ensure_cached_range(HttpConnection *conn,
     return true;
   }
 
+  /* Check front window */
   if (offset < HTTP_FRONT_WINDOW_MAX_BYTES) {
     uint64_t request_end = offset + to_read;
     size_t want = HTTP_FRONT_WINDOW_BYTES;
@@ -2260,6 +2412,17 @@ static bool http_ensure_cached_range(HttpConnection *conn,
       }
       return true;
     }
+  }
+
+  /* Check tail window */
+  g_mutex_lock(&conn->cache_mutex);
+  gboolean tail_covered = http_tail_window_contains(conn, offset, to_read);
+  g_mutex_unlock(&conn->cache_mutex);
+  if (tail_covered) {
+    if (out_to_read) {
+      *out_to_read = to_read;
+    }
+    return true;
   }
 
   http_plan_prefetch_blocks(conn, offset, to_read, &start_block, &end_block);
@@ -2292,6 +2455,10 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
   g_mutex_lock(&conn->cache_mutex);
   if (http_front_window_contains(conn, (uint64_t) pos, to_read)) {
     memcpy(dst, conn->front_window_data + pos, to_read);
+    total = to_read;
+  } else if (http_tail_window_contains(conn, (uint64_t) pos, to_read)) {
+    size_t local_off = (size_t)((uint64_t) pos - conn->tail_window_offset);
+    memcpy(dst, conn->tail_window_data + local_off, to_read);
     total = to_read;
   }
   g_mutex_unlock(&conn->cache_mutex);
@@ -2344,6 +2511,12 @@ size_t _openslide_http_pread(struct _openslide_http_file *file,
     g_mutex_unlock(&conn->cache_mutex);
     return to_read;
   }
+  if (http_tail_window_contains(conn, offset, to_read)) {
+    size_t local_off = (size_t)(offset - conn->tail_window_offset);
+    memcpy(dst, conn->tail_window_data + local_off, to_read);
+    g_mutex_unlock(&conn->cache_mutex);
+    return to_read;
+  }
   g_mutex_unlock(&conn->cache_mutex);
 
   return http_copy_cached_bytes(conn, offset, dst, to_read, err);
@@ -2380,6 +2553,10 @@ bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
 
   g_mutex_lock(&conn->cache_mutex);
   if (http_front_window_view(conn, offset, out_ptr, out_avail)) {
+    g_mutex_unlock(&conn->cache_mutex);
+    return true;
+  }
+  if (http_tail_window_view(conn, offset, out_ptr, out_avail)) {
     g_mutex_unlock(&conn->cache_mutex);
     return true;
   }

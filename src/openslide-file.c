@@ -32,6 +32,14 @@
 #include <glib.h>
 #include <inttypes.h>
 
+/* Debug logging for file operations - set to 0 for production */
+#define FILE_DEBUG 0
+#if FILE_DEBUG
+  #define FILE_LOG(...) fprintf(stderr, __VA_ARGS__)
+#else
+  #define FILE_LOG(...) ((void)0)
+#endif
+
 #ifndef _WIN32
 #include <unistd.h>
 #include <fcntl.h>
@@ -144,10 +152,10 @@ static struct _openslide_file *local_fopen(const char *path, GError **err) {
 struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
   /* Check if this is a remote URL */
   if (_openslide_is_remote_path(path)) {
-    fprintf(stderr, "[FILE] Opening remote path: %s\n", path);
+    FILE_LOG("[FILE] Opening remote path: %s\n", path);
     struct _openslide_http_file *http_handle = _openslide_http_open(path, err);
     if (!http_handle) {
-      fprintf(stderr, "[FILE] FAILED to open remote: %s\n", path);
+      FILE_LOG("[FILE] FAILED to open remote: %s\n", path);
       return NULL;
     }
 
@@ -155,7 +163,7 @@ struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
     file->type = FILE_TYPE_HTTP;
     file->u.http.handle = http_handle;
     file->u.http.uri = g_strdup(path);
-    fprintf(stderr, "[FILE] SUCCESS opened remote: %s\n", path);
+    FILE_LOG("[FILE] SUCCESS opened remote: %s\n", path);
     return file;
   }
 
