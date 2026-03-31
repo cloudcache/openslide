@@ -24,6 +24,7 @@
 
 #include "openslide-private.h"
 #include "openslide-http.h"
+#include "openslide-fsspec.h"
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -48,6 +49,7 @@
 typedef enum {
   FILE_TYPE_LOCAL,
   FILE_TYPE_HTTP,
+  FILE_TYPE_FSSPEC,  /* fsspec-based remote (s3://, gs://, az://, http:// when preferred) */
 } FileType;
 
 struct _openslide_file {
@@ -61,6 +63,10 @@ struct _openslide_file {
       struct _openslide_http_file *handle;
       char *uri;
     } http;
+    struct {
+      struct _openslide_fsspec_file *handle;
+      char *uri;
+    } fsspec;
   } u;
 };
 
@@ -142,12 +148,36 @@ static struct _openslide_file *local_fopen(const char *path, GError **err) {
  * ============================== */
 
 struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
-  /* Check if this is a remote URL */
+  /* Check if this should use fsspec (s3://, gs://, az://, or http with env var) */
+  if (_openslide_is_fsspec_path(path)) {
+    fprintf(stderr, "[FILE] Opening via fsspec: %s\n", path);
+    
+    if (!_openslide_fsspec_available()) {
+      g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                  "fsspec backend required but not available for: %s", path);
+      return NULL;
+    }
+    
+    struct _openslide_fsspec_file *fsspec_handle = _openslide_fsspec_open(path, err);
+    if (!fsspec_handle) {
+      fprintf(stderr, "[FILE] FAILED to open via fsspec: %s\n", path);
+      return NULL;
+    }
+
+    struct _openslide_file *file = g_new0(struct _openslide_file, 1);
+    file->type = FILE_TYPE_FSSPEC;
+    file->u.fsspec.handle = fsspec_handle;
+    file->u.fsspec.uri = g_strdup(path);
+    fprintf(stderr, "[FILE] SUCCESS opened via fsspec: %s\n", path);
+    return file;
+  }
+  
+  /* Check if this is a remote HTTP/HTTPS URL (use curl backend) */
   if (_openslide_is_remote_path(path)) {
-    fprintf(stderr, "[FILE] Opening remote path: %s\n", path);
+    fprintf(stderr, "[FILE] Opening via HTTP: %s\n", path);
     struct _openslide_http_file *http_handle = _openslide_http_open(path, err);
     if (!http_handle) {
-      fprintf(stderr, "[FILE] FAILED to open remote: %s\n", path);
+      fprintf(stderr, "[FILE] FAILED to open via HTTP: %s\n", path);
       return NULL;
     }
 
@@ -155,7 +185,7 @@ struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
     file->type = FILE_TYPE_HTTP;
     file->u.http.handle = http_handle;
     file->u.http.uri = g_strdup(path);
-    fprintf(stderr, "[FILE] SUCCESS opened remote: %s\n", path);
+    fprintf(stderr, "[FILE] SUCCESS opened via HTTP: %s\n", path);
     return file;
   }
 
@@ -170,6 +200,10 @@ struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
 // returns 0/NULL on EOF and 0/non-NULL on I/O error
 size_t _openslide_fread(struct _openslide_file *file, void *buf, size_t size,
                         GError **err) {
+  if (file->type == FILE_TYPE_FSSPEC) {
+    return _openslide_fsspec_read(file->u.fsspec.handle, buf, size, err);
+  }
+  
   if (file->type == FILE_TYPE_HTTP) {
     return _openslide_http_read(file->u.http.handle, buf, size, err);
   }
@@ -193,6 +227,10 @@ size_t _openslide_fread(struct _openslide_file *file, void *buf, size_t size,
 
 bool _openslide_fread_exact(struct _openslide_file *file,
                             void *buf, size_t size, GError **err) {
+  if (file->type == FILE_TYPE_FSSPEC) {
+    return _openslide_fsspec_read_exact(file->u.fsspec.handle, buf, size, err);
+  }
+  
   if (file->type == FILE_TYPE_HTTP) {
     return _openslide_http_read_exact(file->u.http.handle, buf, size, err);
   }
@@ -217,6 +255,10 @@ bool _openslide_fread_exact(struct _openslide_file *file,
 
 bool _openslide_fseek(struct _openslide_file *file, int64_t offset, int whence,
                       GError **err) {
+  if (file->type == FILE_TYPE_FSSPEC) {
+    return _openslide_fsspec_seek(file->u.fsspec.handle, offset, whence, err);
+  }
+  
   if (file->type == FILE_TYPE_HTTP) {
     return _openslide_http_seek(file->u.http.handle, offset, whence, err);
   }
@@ -233,6 +275,10 @@ bool _openslide_fseek(struct _openslide_file *file, int64_t offset, int whence,
  * ============================== */
 
 int64_t _openslide_ftell(struct _openslide_file *file, GError **err) {
+  if (file->type == FILE_TYPE_FSSPEC) {
+    return _openslide_fsspec_tell(file->u.fsspec.handle);
+  }
+  
   if (file->type == FILE_TYPE_HTTP) {
     return _openslide_http_tell(file->u.http.handle);
   }
@@ -249,6 +295,10 @@ int64_t _openslide_ftell(struct _openslide_file *file, GError **err) {
  * ============================== */
 
 int64_t _openslide_fsize(struct _openslide_file *file, GError **err) {
+  if (file->type == FILE_TYPE_FSSPEC) {
+    return _openslide_fsspec_size(file->u.fsspec.handle, err);
+  }
+  
   if (file->type == FILE_TYPE_HTTP) {
     return _openslide_http_size(file->u.http.handle, err);
   }
@@ -283,12 +333,19 @@ void _openslide_fclose(struct _openslide_file *file) {
     return;
   }
 
-  if (file->type == FILE_TYPE_HTTP) {
-    _openslide_http_close(file->u.http.handle);
-    g_free(file->u.http.uri);
-  } else {
-    fclose(file->u.local.fp);  // ci-allow
-    g_free(file->u.local.path);
+  switch (file->type) {
+    case FILE_TYPE_FSSPEC:
+      _openslide_fsspec_close(file->u.fsspec.handle);
+      g_free(file->u.fsspec.uri);
+      break;
+    case FILE_TYPE_HTTP:
+      _openslide_http_close(file->u.http.handle);
+      g_free(file->u.http.uri);
+      break;
+    case FILE_TYPE_LOCAL:
+      fclose(file->u.local.fp);  // ci-allow
+      g_free(file->u.local.path);
+      break;
   }
   g_free(file);
 }
@@ -298,10 +355,20 @@ void _openslide_fclose(struct _openslide_file *file) {
  * ============================== */
 
 bool _openslide_fexists(const char *path, GError **err G_GNUC_UNUSED) {
-  /* For remote files, we'd need to do a HEAD request.
-     For now, only support local file existence check. */
+  /* Check fsspec paths first */
+  if (_openslide_is_fsspec_path(path)) {
+    GError *tmp_err = NULL;
+    struct _openslide_fsspec_file *f = _openslide_fsspec_open(path, &tmp_err);
+    if (f) {
+      _openslide_fsspec_close(f);
+      return true;
+    }
+    g_clear_error(&tmp_err);
+    return false;
+  }
+  
+  /* HTTP paths */
   if (_openslide_is_remote_path(path)) {
-    /* Attempt to open to verify existence */
     GError *tmp_err = NULL;
     struct _openslide_http_file *f = _openslide_http_open(path, &tmp_err);
     if (f) {
@@ -311,6 +378,8 @@ bool _openslide_fexists(const char *path, GError **err G_GNUC_UNUSED) {
     g_clear_error(&tmp_err);
     return false;
   }
+  
+  /* Local file */
   return g_file_test(path, G_FILE_TEST_EXISTS);  // ci-allow
 }
 
@@ -353,8 +422,13 @@ const char *_openslide_fget_path(struct _openslide_file *file) {
   if (!file) {
     return "(null)";
   }
-  if (file->type == FILE_TYPE_HTTP) {
-    return file->u.http.uri;
+  switch (file->type) {
+    case FILE_TYPE_FSSPEC:
+      return file->u.fsspec.uri;
+    case FILE_TYPE_HTTP:
+      return file->u.http.uri;
+    case FILE_TYPE_LOCAL:
+      return file->u.local.path;
   }
-  return file->u.local.path;
+  return "(unknown)";
 }

@@ -172,22 +172,22 @@ dicom_dep = dependency(
   default_options : ['tests=false'],
   version : '>=1.2.0',
 )
-# HTTP backend selection
-http_backend = get_option('http_backend')
-if http_backend == 'fsspec'
-  # fsspec_cpp provides C API to Python fsspec (supports http, s3, gcs, azure)
-  fsspec_dep = dependency('fsspec_cpp', required : true)
-  python_dep = dependency('python3-embed', required : true)
-  curl_dep = declare_dependency()  # empty dep, fsspec handles HTTP
-  message('Using fsspec HTTP backend')
+# HTTP backend (curl) - required for http:// URLs
+curl_dep = dependency(
+  'libcurl',
+  version : '>=7.50.0',
+)
+
+# fsspec backend (optional) - for s3://, gs://, az:// and http:// with OPENSLIDE_USE_FSSPEC=1
+fsspec_dep = dependency('fsspec_cpp', required : false)
+python_dep = dependency('python3-embed', required : false)
+if fsspec_dep.found() and python_dep.found()
+  conf.set('HAVE_FSSPEC_CPP', 1)
+  message('fsspec support enabled (s3://, gs://, az:// protocols available)')
 else
-  curl_dep = dependency(
-    'libcurl',
-    version : '>=7.50.0',
-  )
-  fsspec_dep = declare_dependency()  # empty dep
-  python_dep = declare_dependency()  # empty dep
-  message('Using curl HTTP backend')
+  fsspec_dep = declare_dependency()
+  python_dep = declare_dependency()
+  message('fsspec support disabled (install fsspec_cpp for cloud storage support)')
 endif
 
 # Dependency checks

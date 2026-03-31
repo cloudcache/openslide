@@ -33,10 +33,3 @@ option(
   value : false,
   description : 'For test suite; do not use',
 )
-option(
-  'http_backend',
-  type : 'combo',
-  choices : ['curl', 'fsspec'],
-  value : 'curl',
-  description : 'HTTP backend: curl (native) or fsspec (Python-based, supports S3/GCS/Azure)',
-)
