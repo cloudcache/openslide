@@ -113,15 +113,18 @@ const OpenslideHTTPConfig *_openslide_http_get_config(void) {
 
 /* Tunables for remote open / metadata-heavy access paths.
  * Keep these local so we don't need to change the public config struct yet. */
-#define HTTP_OPEN_PREFETCH_BYTES        (1024 * 1024)   /* 1MB on first open */
-#define HTTP_METADATA_WINDOW_BYTES      (1024 * 1024)   /* Treat first 1MB as metadata-heavy */
-#define HTTP_NORMAL_MAX_EXTENT_BYTES    (1024 * 1024)   /* 1MB for general reads */
-#define HTTP_METADATA_MAX_EXTENT_BYTES  (2 * 1024 * 1024) /* 2MB for header/index/small images */
-#define HTTP_SMALL_READ_THRESHOLD_BYTES (64 * 1024)     /* Tiny reads benefit from modest neighbor prefetch */
-#define HTTP_SMALL_READ_AHEAD_BYTES     (256 * 1024)    /* One extra 256KB window for tiny non-metadata reads */
+#define HTTP_OPEN_PREFETCH_BYTES        (2 * 1024 * 1024)   /* 2MB on first open */
+#define HTTP_METADATA_WINDOW_BYTES      (2 * 1024 * 1024)   /* Treat first 2MB as metadata-heavy */
+#define HTTP_NORMAL_MAX_EXTENT_BYTES    (32 * 1024 * 1024)  /* 32MB - allow large extent merges */
+#define HTTP_METADATA_MAX_EXTENT_BYTES  (32 * 1024 * 1024)  /* 32MB for header/index/tail metadata */
+#define HTTP_SMALL_READ_THRESHOLD_BYTES (64 * 1024)         /* Tiny reads benefit from modest neighbor prefetch */
+#define HTTP_SMALL_READ_AHEAD_BYTES     (1024 * 1024)       /* 1MB extra window for tiny reads */
 
-#define HTTP_FRONT_WINDOW_BYTES         (4 * 1024 * 1024)  /* Grab 4MB up front to collapse metadata chatter */
-#define HTTP_FRONT_WINDOW_MAX_BYTES     (8 * 1024 * 1024)  /* Allow metadata/DZI window to grow to 8MB */
+#define HTTP_FRONT_WINDOW_BYTES         (8 * 1024 * 1024)   /* Grab 8MB up front to collapse metadata chatter */
+#define HTTP_FRONT_WINDOW_MAX_BYTES     (16 * 1024 * 1024)  /* Allow metadata/DZI window to grow to 16MB */
+
+/* Tail window for IFDs often stored at end of SVS files */
+#define HTTP_TAIL_WINDOW_BYTES          (32 * 1024 * 1024)  /* Grab last 32MB - covers typical SVS tail metadata */
 
 
 /* ==============================
