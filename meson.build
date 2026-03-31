@@ -172,10 +172,23 @@ dicom_dep = dependency(
   default_options : ['tests=false'],
   version : '>=1.2.0',
 )
-curl_dep = dependency(
-  'libcurl',
-  version : '>=7.50.0',
-)
+# HTTP backend selection
+http_backend = get_option('http_backend')
+if http_backend == 'fsspec'
+  # fsspec_cpp provides C API to Python fsspec (supports http, s3, gcs, azure)
+  fsspec_dep = dependency('fsspec_cpp', required : true)
+  python_dep = dependency('python3-embed', required : true)
+  curl_dep = declare_dependency()  # empty dep, fsspec handles HTTP
+  message('Using fsspec HTTP backend')
+else
+  curl_dep = dependency(
+    'libcurl',
+    version : '>=7.50.0',
+  )
+  fsspec_dep = declare_dependency()  # empty dep
+  python_dep = declare_dependency()  # empty dep
+  message('Using curl HTTP backend')
+endif
 
 # Dependency checks
 if jpeg_dep.type_name() != 'internal' and not cc.has_function(
