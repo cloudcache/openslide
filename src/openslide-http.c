@@ -1196,9 +1196,7 @@ static bool http_fetch_range(HttpConnection *conn,
 }
 
 /* Fetch multiple ranges in parallel using the shared curl_multi downloader.
- * This is not on the hot path yet, but unlike the previous skeleton it now
- * runs through the same fully-asynchronous machinery as single-range fetches. */
-G_GNUC_UNUSED
+ * Used by http_prefetch_missing_blocks to fire disjoint gaps concurrently. */
 static bool http_fetch_parallel(HttpConnection *conn,
                                 uint64_t *offsets, size_t *lens,
                                 uint8_t **buffers, size_t count,
@@ -1560,6 +1558,10 @@ static bool http_prefetch_missing_blocks(HttpConnection *conn,
                                          guint64 start_block,
                                          guint64 end_block,
                                          GError **err);
+static void http_store_buffer_locked(HttpConnection *conn,
+                                     guint64 start_block,
+                                     const uint8_t *buffer,
+                                     size_t written);
 static void http_plan_prefetch_blocks(HttpConnection *conn,
                                       uint64_t offset,
                                       size_t to_read,
@@ -1707,6 +1709,14 @@ static bool http_fetch_extent(HttpConnection *conn,
   return true;
 }
 
+/* Max disjoint gaps we will collect for parallel fetch */
+#define HTTP_MAX_PARALLEL_GAPS 8
+
+typedef struct {
+  guint64 start_block;
+  guint64 end_block;
+} BlockGap;
+
 static bool http_prefetch_missing_blocks(HttpConnection *conn,
                                          guint64 start_block,
                                          guint64 end_block,
@@ -1715,8 +1725,12 @@ static bool http_prefetch_missing_blocks(HttpConnection *conn,
     return true;
   }
 
+  /* Phase 1: Collect all disjoint missing-block gaps */
+  BlockGap gaps[HTTP_MAX_PARALLEL_GAPS];
+  guint gap_count = 0;
+
   guint64 idx = start_block;
-  while (idx <= end_block) {
+  while (idx <= end_block && gap_count < HTTP_MAX_PARALLEL_GAPS) {
     guint64 miss_start = G_MAXUINT64;
     guint64 miss_end = 0;
 
@@ -1737,14 +1751,98 @@ static bool http_prefetch_missing_blocks(HttpConnection *conn,
       break;
     }
 
-    if (!http_fetch_extent(conn, miss_start, miss_end, err)) {
-      return false;
+    /* Apply extent cap to this gap */
+    miss_end = extent_cap_end_block(conn, miss_start, miss_end);
+    if (miss_end >= miss_start) {
+      gaps[gap_count].start_block = miss_start;
+      gaps[gap_count].end_block = miss_end;
+      gap_count++;
     }
 
     idx = miss_end + 1;
   }
 
-  return true;
+  if (gap_count == 0) {
+    return true;
+  }
+
+  /* Phase 2: Single gap — use existing serial path */
+  if (gap_count == 1) {
+    return http_fetch_extent(conn, gaps[0].start_block, gaps[0].end_block, err);
+  }
+
+  /* Phase 3: Multiple gaps — fetch all ranges in parallel */
+  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+
+  uint64_t offsets[HTTP_MAX_PARALLEL_GAPS];
+  size_t   lens[HTTP_MAX_PARALLEL_GAPS];
+  uint8_t *buffers[HTTP_MAX_PARALLEL_GAPS];
+
+  for (guint i = 0; i < gap_count; i++) {
+    uint64_t start_off = gaps[i].start_block * cfg->block_size;
+    uint64_t end_off   = (gaps[i].end_block + 1) * (uint64_t) cfg->block_size;
+    if (start_off >= conn->file_size) {
+      lens[i] = 0;
+      buffers[i] = NULL;
+      continue;
+    }
+    if (end_off > conn->file_size) {
+      end_off = conn->file_size;
+    }
+    offsets[i] = start_off;
+    lens[i]    = (size_t)(end_off - start_off);
+    buffers[i] = g_malloc(lens[i]);
+
+    /* Reserve blocks as FETCHING so other threads wait */
+    g_mutex_lock(&conn->cache_mutex);
+    for (guint64 bi = gaps[i].start_block; bi <= gaps[i].end_block; bi++) {
+      HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(bi));
+      if (!b) {
+        while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
+          lru_evict(conn);
+        }
+        b = g_new0(HttpBlock, 1);
+        g_cond_init(&b->fetch_cond);
+        lru_insert_front(conn, b, bi);
+        g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(bi), b);
+        conn->cache_count++;
+      }
+      if (b->state != BLOCK_STATE_READY) {
+        b->state = BLOCK_STATE_FETCHING;
+      }
+    }
+    g_mutex_unlock(&conn->cache_mutex);
+  }
+
+  HTTP_LOG("[HTTP-PARALLEL] Fetching %u gaps concurrently\n", gap_count);
+  bool ok = http_fetch_parallel(conn, offsets, lens, buffers, gap_count, err);
+
+  /* Phase 4: Store fetched data into block cache */
+  g_mutex_lock(&conn->cache_mutex);
+  for (guint i = 0; i < gap_count; i++) {
+    if (!buffers[i] || lens[i] == 0) {
+      continue;
+    }
+    if (ok) {
+      http_store_buffer_locked(conn, gaps[i].start_block, buffers[i], lens[i]);
+    } else {
+      /* Mark reserved blocks as failed */
+      for (guint64 bi = gaps[i].start_block; bi <= gaps[i].end_block; bi++) {
+        HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(bi));
+        if (b && b->state == BLOCK_STATE_FETCHING) {
+          g_cond_broadcast(&b->fetch_cond);
+          block_remove_locked(conn, bi, b);
+        }
+      }
+    }
+  }
+  g_mutex_unlock(&conn->cache_mutex);
+
+  for (guint i = 0; i < gap_count; i++) {
+    g_free(buffers[i]);
+  }
+
+  return ok;
 }
 
 static void http_plan_prefetch_blocks(HttpConnection *conn,
