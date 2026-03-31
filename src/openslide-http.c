@@ -145,13 +145,21 @@ typedef struct _lru_node {
   struct _lru_node *next;
 } LruNode;
 
-/* Cache entry with O(1) LRU support */
-typedef struct {
+/* Shared extent buffer - multiple blocks can reference the same buffer */
+typedef struct _extent_buffer {
   uint8_t *data;
   size_t len;
-  LruNode *lru_node;     /* Intrusive O(1) LRU node */
+  volatile gint ref_count;  /* Reference count for shared ownership */
+} ExtentBuffer;
+
+/* Cache entry with O(1) LRU support */
+typedef struct {
+  uint8_t *data;           /* Pointer into extent_buf or owned memory */
+  size_t len;
+  ExtentBuffer *extent_buf; /* Shared buffer (if not NULL, data points into it) */
+  LruNode *lru_node;       /* Intrusive O(1) LRU node */
   BlockState state;
-  GCond fetch_cond;      /* Condition variable for in-flight waiting */
+  GCond fetch_cond;        /* Condition variable for in-flight waiting */
 } HttpBlock;
 
 /* Connection state */
@@ -277,6 +285,8 @@ static bool http_front_window_contains(HttpConnection *conn, uint64_t offset, si
 static bool http_front_window_view(HttpConnection *conn, uint64_t offset, const uint8_t **out_ptr, size_t *out_avail);
 static bool http_fill_tail_window(HttpConnection *conn, GError **err);
 static bool http_tail_window_contains(HttpConnection *conn, uint64_t offset, size_t size);
+static bool http_try_get_ptr(HttpConnection *conn, uint64_t offset, size_t size,
+                             const uint8_t **out_ptr, size_t *out_avail);
 static void http_connection_destroy(HttpConnection *conn);
 static GList *http_pool_collect_expired_locked(void);
 static void http_destroy_connection_list(GList *list);
@@ -1424,12 +1434,73 @@ static bool http_fill_tail_window(HttpConnection *conn, GError **err) {
   return true;
 }
 
+/* Zero-copy read: return pointer to cached data if available.
+ * Caller MUST hold cache_mutex while using the returned pointer.
+ * Returns true if the entire range is available via pointer. */
+static bool http_try_get_ptr(HttpConnection *conn, uint64_t offset, size_t size,
+                             const uint8_t **out_ptr, size_t *out_avail) {
+  /* Try front window */
+  if (conn->front_window_data && offset < conn->front_window_len) {
+    size_t avail = conn->front_window_len - (size_t)offset;
+    *out_ptr = conn->front_window_data + offset;
+    *out_avail = avail;
+    return avail >= size;
+  }
+  
+  /* Try tail window */
+  if (conn->tail_window_data && conn->tail_window_len > 0 &&
+      offset >= conn->tail_window_start) {
+    uint64_t tail_end = conn->tail_window_start + conn->tail_window_len;
+    if (offset < tail_end) {
+      size_t off_in_window = (size_t)(offset - conn->tail_window_start);
+      size_t avail = conn->tail_window_len - off_in_window;
+      *out_ptr = conn->tail_window_data + off_in_window;
+      *out_avail = avail;
+      return avail >= size;
+    }
+  }
+  
+  /* Try block cache - only if entire read fits in one block */
+  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
+  guint64 block_idx = offset / cfg->block_size;
+  uint32_t block_off = offset % cfg->block_size;
+  
+  HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(block_idx));
+  if (b && b->state == BLOCK_STATE_READY && b->data && block_off < b->len) {
+    size_t avail = b->len - block_off;
+    *out_ptr = b->data + block_off;
+    *out_avail = avail;
+    lru_promote(conn, b);
+    return avail >= size;
+  }
+  
+  *out_ptr = NULL;
+  *out_avail = 0;
+  return false;
+}
+
+/* Release reference to shared extent buffer */
+static void extent_buffer_unref(ExtentBuffer *eb) {
+  if (!eb) return;
+  if (g_atomic_int_dec_and_test(&eb->ref_count)) {
+    g_free(eb->data);
+    g_free(eb);
+  }
+}
+
 static void http_block_free(HttpBlock *b) {
   if (!b) {
     return;
   }
-  g_free(b->data);
-  b->data = NULL;
+  /* If block references shared extent buffer, unref it instead of freeing data */
+  if (b->extent_buf) {
+    extent_buffer_unref(b->extent_buf);
+    b->extent_buf = NULL;
+    b->data = NULL;  /* data points into extent_buf, don't free */
+  } else {
+    g_free(b->data);
+    b->data = NULL;
+  }
   if (b->lru_node) {
     g_free(b->lru_node);
     b->lru_node = NULL;
@@ -1582,12 +1653,16 @@ static bool http_fetch_extent(HttpConnection *conn,
   }
   g_mutex_unlock(&conn->cache_mutex);
 
-  /* Allocate buffer for entire extent */
-  uint8_t *buffer = g_malloc(total_len);
+  /* Allocate shared extent buffer - blocks will reference it without copying */
+  ExtentBuffer *extent_buf = g_new0(ExtentBuffer, 1);
+  extent_buf->data = g_malloc(total_len);
+  extent_buf->len = total_len;
+  g_atomic_int_set(&extent_buf->ref_count, 1);  /* Initial ref for this function */
+  
   size_t written = 0;
 
-  if (!http_fetch_range(conn, start_offset, total_len, buffer, &written, NULL, err)) {
-    g_free(buffer);
+  if (!http_fetch_range(conn, start_offset, total_len, extent_buf->data, &written, NULL, err)) {
+    extent_buffer_unref(extent_buf);
     /* Mark reserved blocks as failed and remove them */
     g_mutex_lock(&conn->cache_mutex);
     for (guint64 idx = start_block; idx <= end_block; idx++) {
@@ -1601,7 +1676,7 @@ static bool http_fetch_extent(HttpConnection *conn,
     return false;
   }
 
-  /* Split into blocks and cache them */
+  /* Split into blocks and cache them - zero-copy via shared buffer */
   g_mutex_lock(&conn->cache_mutex);
 
   for (guint64 idx = start_block; idx <= end_block; idx++) {
@@ -1634,11 +1709,20 @@ static bool http_fetch_extent(HttpConnection *conn,
       lru_insert_front(conn, b, idx);
       g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(idx), b);
       conn->cache_count++;
+    } else {
+      /* Clear old data if re-populating */
+      if (b->extent_buf) {
+        extent_buffer_unref(b->extent_buf);
+        b->extent_buf = NULL;
+      } else {
+        g_free(b->data);
+      }
     }
 
-    g_free(b->data);
-    b->data = g_malloc(block_len);
-    memcpy(b->data, buffer + block_start, block_len);
+    /* Zero-copy: point directly into shared extent buffer */
+    g_atomic_int_inc(&extent_buf->ref_count);
+    b->extent_buf = extent_buf;
+    b->data = extent_buf->data + block_start;
     b->len = block_len;
     b->state = BLOCK_STATE_READY;
     lru_promote(conn, b);
@@ -1658,7 +1742,9 @@ static bool http_fetch_extent(HttpConnection *conn,
   }
 
   g_mutex_unlock(&conn->cache_mutex);
-  g_free(buffer);
+  
+  /* Release our reference - blocks now own the buffer */
+  extent_buffer_unref(extent_buf);
 
   return true;
 }
@@ -1857,10 +1943,14 @@ static HttpBlock *http_get_block(HttpConnection *conn,
   /* Store data and signal waiters */
   g_mutex_lock(&conn->cache_mutex);
   /* Free old data if any (shouldn't happen but be safe) */
-  if (b->data) {
+  if (b->extent_buf) {
+    extent_buffer_unref(b->extent_buf);
+    b->extent_buf = NULL;
+  } else if (b->data) {
     g_free(b->data);
   }
   b->data = data;
+  b->extent_buf = NULL;  /* This block owns its data directly */
   b->len = written;
   b->state = BLOCK_STATE_READY;
   lru_promote(conn, b);
@@ -2354,19 +2444,18 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
     return 0;
   }
 
+  /* Try zero-copy first - single memcpy if data fits in one window/block */
   size_t total = 0;
   g_mutex_lock(&conn->cache_mutex);
-  /* Try front window first, then tail window */
-  if (http_front_window_contains(conn, (uint64_t) pos, to_read)) {
-    memcpy(dst, conn->front_window_data + pos, to_read);
-    total = to_read;
-  } else if (http_tail_window_contains(conn, (uint64_t) pos, to_read)) {
-    size_t off = (size_t)((uint64_t)pos - conn->tail_window_start);
-    memcpy(dst, conn->tail_window_data + off, to_read);
+  const uint8_t *ptr = NULL;
+  size_t avail = 0;
+  if (http_try_get_ptr(conn, (uint64_t)pos, to_read, &ptr, &avail) && avail >= to_read) {
+    memcpy(dst, ptr, to_read);
     total = to_read;
   }
   g_mutex_unlock(&conn->cache_mutex);
 
+  /* Fall back to copy-based read for cross-block reads */
   if (total == 0) {
     total = http_copy_cached_bytes(conn, (uint64_t) pos, dst, to_read, err);
   }
@@ -2409,25 +2498,24 @@ size_t _openslide_http_pread(struct _openslide_http_file *file,
     return 0;
   }
 
+  /* Try zero-copy first - avoids memcpy if data fits in one window/block */
   g_mutex_lock(&conn->cache_mutex);
-  /* Try front window first, then tail window */
-  if (http_front_window_contains(conn, offset, to_read)) {
-    memcpy(dst, conn->front_window_data + offset, to_read);
-    g_mutex_unlock(&conn->cache_mutex);
-    return to_read;
-  }
-  if (http_tail_window_contains(conn, offset, to_read)) {
-    size_t off = (size_t)(offset - conn->tail_window_start);
-    memcpy(dst, conn->tail_window_data + off, to_read);
+  const uint8_t *ptr = NULL;
+  size_t avail = 0;
+  if (http_try_get_ptr(conn, offset, to_read, &ptr, &avail) && avail >= to_read) {
+    memcpy(dst, ptr, to_read);  /* Single memcpy from cache */
     g_mutex_unlock(&conn->cache_mutex);
     return to_read;
   }
   g_mutex_unlock(&conn->cache_mutex);
 
+  /* Fall back to copy-based read for cross-block reads */
   return http_copy_cached_bytes(conn, offset, dst, to_read, err);
 }
 
-/* Zero-copy pointer access */
+/* Zero-copy pointer access - returns pointer to cached data.
+ * WARNING: The returned pointer is only valid until the next cache operation.
+ * For safety, caller should complete all reads before any other HTTP operations. */
 bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
                                uint64_t offset,
                                const uint8_t **out_ptr,
@@ -2438,7 +2526,6 @@ bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
   }
 
   HttpConnection *conn = file->conn;
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
 
   if (offset >= conn->file_size) {
     *out_ptr = NULL;
@@ -2446,39 +2533,18 @@ bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
     return true;
   }
 
+  /* Ensure data is cached first */
   size_t to_read = 0;
   if (!http_ensure_cached_range(conn, offset, 1, err, &to_read)) {
     return false;
   }
-  if (to_read == 0) {
-    *out_ptr = NULL;
-    *out_avail = 0;
-    return true;
-  }
 
+  /* Try zero-copy access */
   g_mutex_lock(&conn->cache_mutex);
-  if (http_front_window_view(conn, offset, out_ptr, out_avail)) {
-    g_mutex_unlock(&conn->cache_mutex);
-    return true;
-  }
+  bool ok = http_try_get_ptr(conn, offset, 1, out_ptr, out_avail);
   g_mutex_unlock(&conn->cache_mutex);
-
-  guint64 block_idx = offset / cfg->block_size;
-  uint32_t block_off = offset % cfg->block_size;
-
-  HttpBlock *b = http_get_block(conn, block_idx, err);
-  if (!b || !b->data) {
-    return false;
-  }
-  if (block_off >= b->len) {
-    *out_ptr = NULL;
-    *out_avail = 0;
-    return true;
-  }
-
-  *out_ptr = b->data + block_off;
-  *out_avail = b->len - block_off;
-  return true;
+  
+  return ok;
 }
 
 /* ==============================
