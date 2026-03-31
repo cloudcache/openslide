@@ -174,6 +174,11 @@ typedef struct _http_connection {
   uint8_t *front_window_data;
   size_t front_window_len;
 
+  /* Tail window for IFDs often stored at end of SVS files */
+  uint8_t *tail_window_data;
+  uint64_t tail_window_start;  /* Byte offset where tail window begins */
+  size_t tail_window_len;
+
   ConnState state;
   GCond state_cond;      /* Wait for connection ready */
 
@@ -270,6 +275,8 @@ static HttpBlock *http_get_block(HttpConnection *conn,
 static bool http_fill_front_window(HttpConnection *conn, size_t want_bytes, GError **err);
 static bool http_front_window_contains(HttpConnection *conn, uint64_t offset, size_t size);
 static bool http_front_window_view(HttpConnection *conn, uint64_t offset, const uint8_t **out_ptr, size_t *out_avail);
+static bool http_fill_tail_window(HttpConnection *conn, GError **err);
+static bool http_tail_window_contains(HttpConnection *conn, uint64_t offset, size_t size);
 static void http_connection_destroy(HttpConnection *conn);
 static GList *http_pool_collect_expired_locked(void);
 static void http_destroy_connection_list(GList *list);
@@ -1348,6 +1355,75 @@ static bool http_fill_front_window(HttpConnection *conn, size_t want_bytes, GErr
   return true;
 }
 
+/* Tail window helpers - SVS files often have IFD at the end */
+static bool http_tail_window_contains(HttpConnection *conn, uint64_t offset, size_t size) {
+  if (size == 0 || conn->tail_window_data == NULL || conn->tail_window_len == 0) {
+    return false;
+  }
+  uint64_t tail_end = conn->tail_window_start + conn->tail_window_len;
+  return offset >= conn->tail_window_start && offset + size <= tail_end;
+}
+
+/* Fill tail window - grab last N bytes of file for IFDs often at end of SVS */
+static bool http_fill_tail_window(HttpConnection *conn, GError **err) {
+  if (conn->file_size == 0 || conn->file_size <= HTTP_FRONT_WINDOW_MAX_BYTES) {
+    /* Small file - front window covers everything */
+    return true;
+  }
+  
+  g_mutex_lock(&conn->cache_mutex);
+  if (conn->tail_window_data != NULL && conn->tail_window_len > 0) {
+    g_mutex_unlock(&conn->cache_mutex);
+    return true;  /* Already filled */
+  }
+  g_mutex_unlock(&conn->cache_mutex);
+  
+  size_t tail_size = HTTP_TAIL_WINDOW_BYTES;
+  if (tail_size > conn->file_size) {
+    tail_size = (size_t)conn->file_size;
+  }
+  
+  uint64_t tail_start = conn->file_size - tail_size;
+  
+  /* Don't overlap with front window */
+  if (tail_start < conn->front_window_len) {
+    if (conn->front_window_len >= conn->file_size) {
+      return true;  /* Front window covers entire file */
+    }
+    tail_start = conn->front_window_len;
+    tail_size = (size_t)(conn->file_size - tail_start);
+  }
+  
+  if (tail_size == 0) {
+    return true;
+  }
+  
+  HTTP_LOG("[HTTP-TAIL] Fetching tail window: offset=%" PRIu64 " len=%zu\n", tail_start, tail_size);
+  
+  uint8_t *buffer = g_malloc(tail_size);
+  size_t written = 0;
+  uint64_t discovered_size = 0;
+  
+  if (!http_fetch_range(conn, tail_start, tail_size, buffer, &written, &discovered_size, err) || written == 0) {
+    g_free(buffer);
+    return false;
+  }
+  
+  uint8_t *owned = g_realloc(buffer, written);
+  
+  g_mutex_lock(&conn->cache_mutex);
+  if (conn->tail_window_data == NULL) {
+    conn->tail_window_data = owned;
+    conn->tail_window_start = tail_start;
+    conn->tail_window_len = written;
+    owned = NULL;
+  }
+  g_mutex_unlock(&conn->cache_mutex);
+  
+  g_free(owned);
+  return true;
+}
+
 static void http_block_free(HttpBlock *b) {
   if (!b) {
     return;
@@ -1867,6 +1943,10 @@ static void http_connection_destroy(HttpConnection *conn) {
   g_free(conn->front_window_data);
   conn->front_window_data = NULL;
   conn->front_window_len = 0;
+  g_free(conn->tail_window_data);
+  conn->tail_window_data = NULL;
+  conn->tail_window_start = 0;
+  conn->tail_window_len = 0;
   conn->lru_head = NULL;
   conn->lru_tail = NULL;
   g_mutex_unlock(&conn->cache_mutex);
@@ -1981,8 +2061,13 @@ static bool http_prime_connection(HttpConnection *conn, uint64_t *out_size, GErr
   *out_size = conn->file_size > 0 ? conn->file_size : conn->front_window_len;
   g_mutex_unlock(&conn->cache_mutex);
 
-  HTTP_LOG("[HTTP-PRIME] %s size=%" PRIu64 " front_window=%zuB\n",
-           conn->uri, *out_size, conn->front_window_len);
+  /* Also fill tail window for IFDs at end of SVS files */
+  if (*out_size > HTTP_FRONT_WINDOW_MAX_BYTES) {
+    http_fill_tail_window(conn, NULL);  /* Ignore errors - tail is optional */
+  }
+
+  HTTP_LOG("[HTTP-PRIME] %s size=%" PRIu64 " front_window=%zuB tail_window=%zuB\n",
+           conn->uri, *out_size, conn->front_window_len, conn->tail_window_len);
   return *out_size > 0;
 }
 
@@ -2211,6 +2296,7 @@ static bool http_ensure_cached_range(HttpConnection *conn,
     return true;
   }
 
+  /* Check if front window covers this range */
   if (offset < HTTP_FRONT_WINDOW_MAX_BYTES) {
     uint64_t request_end = offset + to_read;
     size_t want = HTTP_FRONT_WINDOW_BYTES;
@@ -2229,6 +2315,17 @@ static bool http_ensure_cached_range(HttpConnection *conn,
       }
       return true;
     }
+  }
+
+  /* Check if tail window covers this range (IFD at end of file) */
+  g_mutex_lock(&conn->cache_mutex);
+  gboolean tail_covered = http_tail_window_contains(conn, offset, to_read);
+  g_mutex_unlock(&conn->cache_mutex);
+  if (tail_covered) {
+    if (out_to_read) {
+      *out_to_read = to_read;
+    }
+    return true;
   }
 
   http_plan_prefetch_blocks(conn, offset, to_read, &start_block, &end_block);
@@ -2259,8 +2356,13 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
 
   size_t total = 0;
   g_mutex_lock(&conn->cache_mutex);
+  /* Try front window first, then tail window */
   if (http_front_window_contains(conn, (uint64_t) pos, to_read)) {
     memcpy(dst, conn->front_window_data + pos, to_read);
+    total = to_read;
+  } else if (http_tail_window_contains(conn, (uint64_t) pos, to_read)) {
+    size_t off = (size_t)((uint64_t)pos - conn->tail_window_start);
+    memcpy(dst, conn->tail_window_data + off, to_read);
     total = to_read;
   }
   g_mutex_unlock(&conn->cache_mutex);
@@ -2308,8 +2410,15 @@ size_t _openslide_http_pread(struct _openslide_http_file *file,
   }
 
   g_mutex_lock(&conn->cache_mutex);
+  /* Try front window first, then tail window */
   if (http_front_window_contains(conn, offset, to_read)) {
     memcpy(dst, conn->front_window_data + offset, to_read);
+    g_mutex_unlock(&conn->cache_mutex);
+    return to_read;
+  }
+  if (http_tail_window_contains(conn, offset, to_read)) {
+    size_t off = (size_t)(offset - conn->tail_window_start);
+    memcpy(dst, conn->tail_window_data + off, to_read);
     g_mutex_unlock(&conn->cache_mutex);
     return to_read;
   }
