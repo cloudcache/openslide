@@ -24,7 +24,7 @@
 
 #include "openslide-private.h"
 #include "openslide-http.h"
-#include "openslide-fsspec.h"
+#include "openslide-opendal.h"
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -49,7 +49,7 @@
 typedef enum {
   FILE_TYPE_LOCAL,
   FILE_TYPE_HTTP,
-  FILE_TYPE_FSSPEC,  /* fsspec-based remote (s3://, gs://, az://, http:// when preferred) */
+  FILE_TYPE_OPENDAL,  /* opendal-based remote (s3://, gs://, az://, http:// when preferred) */
 } FileType;
 
 struct _openslide_file {
@@ -64,9 +64,9 @@ struct _openslide_file {
       char *uri;
     } http;
     struct {
-      struct _openslide_fsspec_file *handle;
+      struct _openslide_opendal_file *handle;
       char *uri;
-    } fsspec;
+    } opendal;
   } u;
 };
 
@@ -148,27 +148,27 @@ static struct _openslide_file *local_fopen(const char *path, GError **err) {
  * ============================== */
 
 struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
-  /* Check if this should use fsspec (s3://, gs://, az://, or http with env var) */
-  if (_openslide_is_fsspec_path(path)) {
-    fprintf(stderr, "[FILE] Opening via fsspec: %s\n", path);
+  /* Check if this should use opendal (s3://, gs://, az://, or http with env var) */
+  if (_openslide_is_opendal_path(path)) {
+    fprintf(stderr, "[FILE] Opening via opendal: %s\n", path);
     
-    if (!_openslide_fsspec_available()) {
+    if (!_openslide_opendal_available()) {
       g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
-                  "fsspec backend required but not available for: %s", path);
+                  "opendal backend required but not available for: %s", path);
       return NULL;
     }
     
-    struct _openslide_fsspec_file *fsspec_handle = _openslide_fsspec_open(path, err);
-    if (!fsspec_handle) {
-      fprintf(stderr, "[FILE] FAILED to open via fsspec: %s\n", path);
+    struct _openslide_opendal_file *opendal_handle = _openslide_opendal_open(path, err);
+    if (!opendal_handle) {
+      fprintf(stderr, "[FILE] FAILED to open via opendal: %s\n", path);
       return NULL;
     }
 
     struct _openslide_file *file = g_new0(struct _openslide_file, 1);
-    file->type = FILE_TYPE_FSSPEC;
-    file->u.fsspec.handle = fsspec_handle;
-    file->u.fsspec.uri = g_strdup(path);
-    fprintf(stderr, "[FILE] SUCCESS opened via fsspec: %s\n", path);
+    file->type = FILE_TYPE_OPENDAL;
+    file->u.opendal.handle = opendal_handle;
+    file->u.opendal.uri = g_strdup(path);
+    fprintf(stderr, "[FILE] SUCCESS opened via opendal: %s\n", path);
     return file;
   }
   
@@ -200,8 +200,8 @@ struct _openslide_file *_openslide_fopen(const char *path, GError **err) {
 // returns 0/NULL on EOF and 0/non-NULL on I/O error
 size_t _openslide_fread(struct _openslide_file *file, void *buf, size_t size,
                         GError **err) {
-  if (file->type == FILE_TYPE_FSSPEC) {
-    return _openslide_fsspec_read(file->u.fsspec.handle, buf, size, err);
+  if (file->type == FILE_TYPE_OPENDAL) {
+    return _openslide_opendal_read(file->u.opendal.handle, buf, size, err);
   }
   
   if (file->type == FILE_TYPE_HTTP) {
@@ -227,8 +227,8 @@ size_t _openslide_fread(struct _openslide_file *file, void *buf, size_t size,
 
 bool _openslide_fread_exact(struct _openslide_file *file,
                             void *buf, size_t size, GError **err) {
-  if (file->type == FILE_TYPE_FSSPEC) {
-    return _openslide_fsspec_read_exact(file->u.fsspec.handle, buf, size, err);
+  if (file->type == FILE_TYPE_OPENDAL) {
+    return _openslide_opendal_read_exact(file->u.opendal.handle, buf, size, err);
   }
   
   if (file->type == FILE_TYPE_HTTP) {
@@ -255,8 +255,8 @@ bool _openslide_fread_exact(struct _openslide_file *file,
 
 bool _openslide_fseek(struct _openslide_file *file, int64_t offset, int whence,
                       GError **err) {
-  if (file->type == FILE_TYPE_FSSPEC) {
-    return _openslide_fsspec_seek(file->u.fsspec.handle, offset, whence, err);
+  if (file->type == FILE_TYPE_OPENDAL) {
+    return _openslide_opendal_seek(file->u.opendal.handle, offset, whence, err);
   }
   
   if (file->type == FILE_TYPE_HTTP) {
@@ -275,8 +275,8 @@ bool _openslide_fseek(struct _openslide_file *file, int64_t offset, int whence,
  * ============================== */
 
 int64_t _openslide_ftell(struct _openslide_file *file, GError **err) {
-  if (file->type == FILE_TYPE_FSSPEC) {
-    return _openslide_fsspec_tell(file->u.fsspec.handle);
+  if (file->type == FILE_TYPE_OPENDAL) {
+    return _openslide_opendal_tell(file->u.opendal.handle);
   }
   
   if (file->type == FILE_TYPE_HTTP) {
@@ -295,8 +295,8 @@ int64_t _openslide_ftell(struct _openslide_file *file, GError **err) {
  * ============================== */
 
 int64_t _openslide_fsize(struct _openslide_file *file, GError **err) {
-  if (file->type == FILE_TYPE_FSSPEC) {
-    return _openslide_fsspec_size(file->u.fsspec.handle, err);
+  if (file->type == FILE_TYPE_OPENDAL) {
+    return _openslide_opendal_size(file->u.opendal.handle, err);
   }
   
   if (file->type == FILE_TYPE_HTTP) {
@@ -334,9 +334,9 @@ void _openslide_fclose(struct _openslide_file *file) {
   }
 
   switch (file->type) {
-    case FILE_TYPE_FSSPEC:
-      _openslide_fsspec_close(file->u.fsspec.handle);
-      g_free(file->u.fsspec.uri);
+    case FILE_TYPE_OPENDAL:
+      _openslide_opendal_close(file->u.opendal.handle);
+      g_free(file->u.opendal.uri);
       break;
     case FILE_TYPE_HTTP:
       _openslide_http_close(file->u.http.handle);
@@ -355,12 +355,12 @@ void _openslide_fclose(struct _openslide_file *file) {
  * ============================== */
 
 bool _openslide_fexists(const char *path, GError **err G_GNUC_UNUSED) {
-  /* Check fsspec paths first */
-  if (_openslide_is_fsspec_path(path)) {
+  /* Check opendal paths first */
+  if (_openslide_is_opendal_path(path)) {
     GError *tmp_err = NULL;
-    struct _openslide_fsspec_file *f = _openslide_fsspec_open(path, &tmp_err);
+    struct _openslide_opendal_file *f = _openslide_opendal_open(path, &tmp_err);
     if (f) {
-      _openslide_fsspec_close(f);
+      _openslide_opendal_close(f);
       return true;
     }
     g_clear_error(&tmp_err);
@@ -423,8 +423,8 @@ const char *_openslide_fget_path(struct _openslide_file *file) {
     return "(null)";
   }
   switch (file->type) {
-    case FILE_TYPE_FSSPEC:
-      return file->u.fsspec.uri;
+    case FILE_TYPE_OPENDAL:
+      return file->u.opendal.uri;
     case FILE_TYPE_HTTP:
       return file->u.http.uri;
     case FILE_TYPE_LOCAL:

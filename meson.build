@@ -178,16 +178,15 @@ curl_dep = dependency(
   version : '>=7.50.0',
 )
 
-# fsspec backend (optional) - for s3://, gs://, az:// and http:// with OPENSLIDE_USE_FSSPEC=1
-fsspec_dep = dependency('fsspec_cpp', required : false)
-python_dep = dependency('python3-embed', required : false)
-if fsspec_dep.found() and python_dep.found()
-  conf.set('HAVE_FSSPEC_CPP', 1)
-  message('fsspec support enabled (s3://, gs://, az:// protocols available)')
+# OpenDAL backend (optional) - for s3://, gs://, az:// and http:// with OPENSLIDE_USE_OPENDAL=1
+# OpenDAL is a Rust-based unified data access layer with C bindings
+opendal_dep = dependency('opendal_c', required : false)
+if opendal_dep.found()
+  conf.set('HAVE_OPENDAL', 1)
+  message('OpenDAL support enabled (s3://, gs://, az:// protocols available)')
 else
-  fsspec_dep = declare_dependency()
-  python_dep = declare_dependency()
-  message('fsspec support disabled (install fsspec_cpp for cloud storage support)')
+  opendal_dep = declare_dependency()
+  message('OpenDAL support disabled (install opendal-c for cloud storage support)')
 endif
 
 # Dependency checks
