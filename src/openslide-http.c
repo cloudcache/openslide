@@ -111,48 +111,68 @@ const OpenslideHTTPConfig *_openslide_http_get_config(void) {
   return &http_config;
 }
 
-/* Tunables for remote open / metadata-heavy access paths.
- * Keep these local so we don't need to change the public config struct yet. */
-#define HTTP_OPEN_PREFETCH_BYTES        (1024 * 1024)   /* 1MB on first open */
-#define HTTP_METADATA_WINDOW_BYTES      (1024 * 1024)   /* Treat first 1MB as metadata-heavy */
-#define HTTP_NORMAL_MAX_EXTENT_BYTES    (1024 * 1024)   /* 1MB for general reads */
-#define HTTP_METADATA_MAX_EXTENT_BYTES  (2 * 1024 * 1024) /* 2MB for header/index/small images */
-#define HTTP_SMALL_READ_THRESHOLD_BYTES (64 * 1024)     /* Tiny reads benefit from modest neighbor prefetch */
-#define HTTP_SMALL_READ_AHEAD_BYTES     (256 * 1024)    /* One extra 256KB window for tiny non-metadata reads */
+/* ==============================
+ * Tunables — Sparse Cache + Adaptive Prefetch
+ * ============================== */
 
-#define HTTP_FRONT_WINDOW_BYTES         (4 * 1024 * 1024)  /* Grab 4MB up front to collapse metadata chatter */
-#define HTTP_FRONT_WINDOW_MAX_BYTES     (8 * 1024 * 1024)  /* Allow metadata/DZI window to grow to 8MB */
-#define HTTP_TAIL_WINDOW_BYTES          (4 * 1024 * 1024)  /* Grab 4MB from file end for TIFF IFD tail reads */
-#define HTTP_TAIL_MAX_EXTENT_BYTES      (4 * 1024 * 1024)  /* 4MB extent cap for tail region reads */
-#define HTTP_TAIL_REGION_BYTES          (8 * 1024 * 1024)  /* "near end" = last 8MB of file */
+/* Sparse cache limits */
+#define SC_MAX_REGIONS          512              /* Max cached regions */
+#define SC_MAX_BYTES_DEFAULT    (256 * 1024 * 1024) /* 256MB default */
+#define SC_MERGE_GAP_BYTES      (64 * 1024)      /* Auto-merge gap */
+#define SC_MIN_FETCH_BYTES      (256 * 1024)     /* Minimum HTTP fetch */
 
+/* Adaptive prefetch */
+#define AP_INITIAL_READAHEAD    (256 * 1024)     /* 256KB initial */
+#define AP_MAX_READAHEAD        (16 * 1024 * 1024) /* 16MB max */
+#define AP_SEQ_THRESHOLD        3                /* Ramp-up threshold */
+
+/* Connection priming */
+#define PRIME_FRONT_BYTES       (4 * 1024 * 1024)  /* 4MB from start */
+#define PRIME_TAIL_BYTES        (4 * 1024 * 1024)  /* 4MB from end */
+#define PRIME_ADAPTIVE_DIVISOR  50               /* ~2% of file */
+#define PRIME_ADAPTIVE_MAX      (32 * 1024 * 1024) /* 32MB cap */
+
+/* In-flight dedup */
+#define MAX_INFLIGHT_RANGES     16
+
+/* Gap coalescing for cache miss handler */
+#define COALESCE_MAX_GAP        (64 * 1024)      /* Merge gaps < 64KB */
+#define COALESCE_MAX_RANGES     8                /* Max gap slots */
+#define COALESCE_MAX_SPAN       (8 * 1024 * 1024) /* Max merged span */
 
 /* ==============================
  * Internal Data Structures
  * ============================== */
 
-/* Block state for in-flight tracking */
-typedef enum {
-  BLOCK_STATE_EMPTY = 0,
-  BLOCK_STATE_FETCHING,  /* Being downloaded - other threads wait */
-  BLOCK_STATE_READY      /* Data available */
-} BlockState;
+/* --- Sparse Cache: interval-based range cache --- */
 
-/* Intrusive LRU node for O(1) operations */
-typedef struct _lru_node {
-  guint64 block_idx;
-  struct _lru_node *prev;
-  struct _lru_node *next;
-} LruNode;
-
-/* Cache entry with O(1) LRU support */
 typedef struct {
-  uint8_t *data;
-  size_t len;
-  LruNode *lru_node;     /* Intrusive O(1) LRU node */
-  BlockState state;
-  GCond fetch_cond;      /* Condition variable for in-flight waiting */
-} HttpBlock;
+  uint64_t offset;      /* start byte offset in file */
+  size_t   len;         /* length of cached data */
+  uint8_t *data;        /* owned buffer */
+  gint64   last_access; /* monotonic time for LRU */
+} CachedRegion;
+
+typedef struct {
+  CachedRegion *regions;    /* sorted array by offset */
+  guint         count;      /* number of regions */
+  guint         capacity;   /* allocated slots */
+  size_t        total_bytes;/* sum of all region lengths */
+  size_t        max_bytes;  /* eviction threshold */
+} SparseCache;
+
+typedef struct {
+  uint64_t offset;
+  size_t   len;
+} CacheGap;
+
+/* In-flight fetch tracking for dedup */
+typedef struct {
+  uint64_t offset;
+  size_t   len;
+  gboolean active;
+  GCond    cond;
+} InflightRange;
 
 /* CURL handle pool entry */
 typedef struct {
@@ -166,62 +186,51 @@ typedef struct {
 /* Connection state */
 typedef enum {
   CONN_STATE_INIT = 0,
-  CONN_STATE_CONNECTING,  /* HEAD request in progress */
-  CONN_STATE_READY,       /* Ready for use */
+  CONN_STATE_CONNECTING,
+  CONN_STATE_READY,
   CONN_STATE_ERROR,
   CONN_STATE_CLOSING
 } ConnState;
 
-/* Shared connection info */
+/* Shared connection info — one per URI */
 typedef struct _http_connection {
   gchar *uri;
   uint64_t file_size;
 
-  /* Front window for metadata-heavy reads.  This is separate from block cache
-   * so that dozens of tiny TIFF/IFD reads do not turn into dozens of HTTP
-   * transactions. */
-  uint8_t *front_window_data;
-  size_t front_window_len;
+  /* Unified sparse range cache */
+  SparseCache cache;
+  GMutex cache_mutex;
 
-  /* Tail window for TIFF IFD / strip-offset reads near end of file */
-  uint8_t *tail_window_data;
-  size_t   tail_window_len;
-  uint64_t tail_window_offset;   /* absolute file offset where tail data starts */
+  /* In-flight fetch dedup */
+  InflightRange inflight[MAX_INFLIGHT_RANGES];
 
   ConnState state;
-  GCond state_cond;      /* Wait for connection ready */
-
-  GHashTable *block_map;  /* block_idx -> HttpBlock* */
-  LruNode *lru_head;      /* Most recently used */
-  LruNode *lru_tail;      /* Least recently used */
-  guint cache_count;
-  GMutex cache_mutex;     /* Separate lock for cache only */
+  GCond state_cond;
 
   /* CURL handle pool */
   CurlHandle curl_pool[MAX_CURL_HANDLES];
   GMutex curl_mutex;
 
   gint ref_count;
-  gint64 last_used_us;    /* Last time this pooled connection was borrowed/released */
-  GMutex mutex;           /* Protects ref_count, state, and last_used_us */
+  gint64 last_used_us;
+  GMutex mutex;
 
 #if HTTP_STATS
-  /* Per-connection stats (atomic, using gint for compatibility) */
   volatile gint range_requests;
-  volatile gint range_bytes_kb;    /* in KB */
-  volatile gint range_time_ms;     /* in ms */
+  volatile gint range_bytes_kb;
+  volatile gint range_time_ms;
 #endif
 } HttpConnection;
 
-/* Per-open file handle */
+/* Per-open file handle with adaptive prefetch state */
 struct _openslide_http_file {
   HttpConnection *conn;
   int64_t position;
-  
-  /* Read-ahead tracking */
-  int64_t last_read_end;
-  guint64 last_block_idx;
-  guint32 sequential_hits;
+
+  /* Adaptive prefetch tracking */
+  int64_t  last_read_end;
+  uint32_t sequential_count;
+  size_t   readahead_size;
 };
 
 typedef struct {
@@ -285,16 +294,9 @@ static void curl_unlock_cb(CURL *handle G_GNUC_UNUSED,
   }
 }
 
+/* Forward declarations */
 static void async_downloader_init(void);
 static void async_downloader_shutdown(void);
-static HttpBlock *http_get_block(HttpConnection *conn,
-                                 guint64 block_idx, GError **err);
-static bool http_fill_front_window(HttpConnection *conn, size_t want_bytes, GError **err);
-static bool http_front_window_contains(HttpConnection *conn, uint64_t offset, size_t size);
-static bool http_front_window_view(HttpConnection *conn, uint64_t offset, const uint8_t **out_ptr, size_t *out_avail);
-static bool http_fill_tail_window(HttpConnection *conn, size_t want_bytes, GError **err);
-static bool http_tail_window_contains(HttpConnection *conn, uint64_t offset, size_t size);
-static bool http_tail_window_view(HttpConnection *conn, uint64_t offset, const uint8_t **out_ptr, size_t *out_avail);
 static void http_connection_destroy(HttpConnection *conn);
 static GList *http_pool_collect_expired_locked(void);
 static void http_destroy_connection_list(GList *list);
@@ -446,14 +448,14 @@ static void http_curl_setup_common(CURL *curl, const char *uri) {
   curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0L);
   curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 0L);
   curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
-  
+
 #ifdef CURL_HTTP_VERSION_2_0
   curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
 #endif
 #ifdef CURLOPT_TCP_FASTOPEN
   curl_easy_setopt(curl, CURLOPT_TCP_FASTOPEN, 1L);
 #endif
-  
+
   curl_easy_setopt(curl, CURLOPT_USERAGENT, "OpenSlide/4.0 libcurl");
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)cfg->connect_timeout_ms);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)cfg->transfer_timeout_ms);
@@ -1110,6 +1112,10 @@ static void async_downloader_shutdown(void) {
   g_downloader.initialized = FALSE;
 }
 
+/* ==============================
+ * HTTP Range Fetch (via async downloader)
+ * ============================== */
+
 static gint64 get_time_us(void) {
   return g_get_monotonic_time();
 }
@@ -1195,8 +1201,7 @@ static bool http_fetch_range(HttpConnection *conn,
   return job.success;
 }
 
-/* Fetch multiple ranges in parallel using the shared curl_multi downloader.
- * Used by http_prefetch_missing_blocks to fire disjoint gaps concurrently. */
+/* Fetch multiple ranges in parallel using the shared curl_multi downloader. */
 static bool http_fetch_parallel(HttpConnection *conn,
                                 uint64_t *offsets, size_t *lens,
                                 uint8_t **buffers, size_t count,
@@ -1256,760 +1261,510 @@ static bool http_fetch_parallel(HttpConnection *conn,
   g_free(jobs);
   return all_ok;
 }
+
 /* ==============================
- * LRU Cache Management (O(1) operations with intrusive linked list)
+ * Sparse Cache Implementation
+ *
+ * Unified interval-based range cache replacing separate front_window,
+ * tail_window, and block_map.  Regions are sorted by offset, auto-merged
+ * on insert, and evicted via LRU when the cache exceeds its byte limit.
  * ============================== */
 
-static void lru_insert_front(HttpConnection *conn, HttpBlock *block, guint64 block_idx) {
-  LruNode *node = g_new0(LruNode, 1);
-  node->block_idx = block_idx;
-  node->next = conn->lru_head;
-  if (conn->lru_head) {
-    conn->lru_head->prev = node;
-  } else {
-    conn->lru_tail = node;
-  }
-  conn->lru_head = node;
-  block->lru_node = node;
+static void sparse_cache_init(SparseCache *sc, size_t max_bytes) {
+  sc->regions = NULL;
+  sc->count = 0;
+  sc->capacity = 0;
+  sc->total_bytes = 0;
+  sc->max_bytes = max_bytes;
 }
 
-static void lru_remove_node(HttpConnection *conn, LruNode *node) {
-  if (!node) {
-    return;
+static void sparse_cache_destroy(SparseCache *sc) {
+  for (guint i = 0; i < sc->count; i++) {
+    g_free(sc->regions[i].data);
   }
-  if (node->prev) {
-    node->prev->next = node->next;
-  } else {
-    conn->lru_head = node->next;
-  }
-  if (node->next) {
-    node->next->prev = node->prev;
-  } else {
-    conn->lru_tail = node->prev;
-  }
-  node->prev = NULL;
-  node->next = NULL;
+  g_free(sc->regions);
+  sc->regions = NULL;
+  sc->count = 0;
+  sc->capacity = 0;
+  sc->total_bytes = 0;
 }
 
-static void lru_promote(HttpConnection *conn, HttpBlock *block) {
-  LruNode *node = block ? block->lru_node : NULL;
-  if (!node || conn->lru_head == node) {
-    return;
+/* Binary search: find first region whose end (offset+len) > target_offset.
+ * That is the first region that could contain target_offset. */
+static guint sparse_cache_find(const SparseCache *sc, uint64_t offset) {
+  guint lo = 0, hi = sc->count;
+  while (lo < hi) {
+    guint mid = lo + (hi - lo) / 2;
+    if (sc->regions[mid].offset + sc->regions[mid].len <= offset) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
   }
-  lru_remove_node(conn, node);
-  node->next = conn->lru_head;
-  if (conn->lru_head) {
-    conn->lru_head->prev = node;
-  } else {
-    conn->lru_tail = node;
-  }
-  conn->lru_head = node;
+  return lo;
 }
 
-static bool http_front_window_contains(HttpConnection *conn, uint64_t offset, size_t size) {
-  if (size == 0) {
-    return true;
-  }
-  return conn->front_window_data != NULL &&
-         offset < conn->front_window_len &&
-         offset + size <= conn->front_window_len;
+/* Check if [offset, offset+size) is fully contained in one cached region.
+ * Must hold cache_mutex. */
+static gboolean sparse_cache_contains(SparseCache *sc, uint64_t offset, size_t size) {
+  if (size == 0) return TRUE;
+  guint idx = sparse_cache_find(sc, offset);
+  if (idx >= sc->count) return FALSE;
+  CachedRegion *r = &sc->regions[idx];
+  return (r->offset <= offset && r->offset + r->len >= offset + size);
 }
 
-static bool http_front_window_view(HttpConnection *conn, uint64_t offset,
-                                   const uint8_t **out_ptr, size_t *out_avail) {
-  if (!http_front_window_contains(conn, offset, 1)) {
-    return false;
-  }
-  *out_ptr = conn->front_window_data + offset;
-  *out_avail = conn->front_window_len - (size_t) offset;
-  return true;
-}
-
-static void http_front_window_replace_locked(HttpConnection *conn,
-                                             uint8_t *buffer, size_t len) {
-  g_free(conn->front_window_data);
-  conn->front_window_data = buffer;
-  conn->front_window_len = len;
-}
-
-static bool http_fill_front_window(HttpConnection *conn, size_t want_bytes, GError **err) {
-  size_t capped = MIN((size_t) HTTP_FRONT_WINDOW_MAX_BYTES, want_bytes);
-  if (conn->file_size > 0) {
-    capped = MIN(capped, (size_t) conn->file_size);
-  }
-  if (capped == 0) {
-    return true;
-  }
-
-  g_mutex_lock(&conn->cache_mutex);
-  if (conn->front_window_len >= capped && conn->front_window_data != NULL) {
-    g_mutex_unlock(&conn->cache_mutex);
-    return true;
-  }
-  g_mutex_unlock(&conn->cache_mutex);
-
-  uint8_t *buffer = g_malloc(capped);
-  size_t written = 0;
-  uint64_t discovered_size = 0;
-
-  if (!http_fetch_range(conn, 0, capped, buffer, &written, &discovered_size, err) || written == 0) {
-    g_free(buffer);
-    return false;
-  }
-
-  if (discovered_size == 0) {
-    discovered_size = written < capped ? written : conn->file_size;
-  }
-  if (discovered_size == 0) {
-    discovered_size = written;
-  }
-
-  uint8_t *owned = g_realloc(buffer, written);
-
-  g_mutex_lock(&conn->cache_mutex);
-  if (discovered_size > 0) {
-    conn->file_size = discovered_size;
-  }
-  if (written > conn->front_window_len || conn->front_window_data == NULL) {
-    http_front_window_replace_locked(conn, owned, written);
-    owned = NULL;
-  }
-  g_mutex_unlock(&conn->cache_mutex);
-
-  g_free(owned);
-  return true;
-}
-
-/* ---- Tail window: covers the last N bytes of the file ---- */
-
-static bool http_tail_window_contains(HttpConnection *conn, uint64_t offset, size_t size) {
-  if (size == 0) {
-    return true;
-  }
-  if (!conn->tail_window_data || conn->file_size == 0) {
-    return false;
-  }
-  return offset >= conn->tail_window_offset &&
-         offset + size <= conn->tail_window_offset + conn->tail_window_len;
-}
-
-static bool http_tail_window_view(HttpConnection *conn, uint64_t offset,
+/* Return a zero-copy view into cached data at offset.
+ * Sets *out_ptr and *out_avail (bytes available from that pointer).
+ * Returns TRUE if data is available at offset.  Must hold cache_mutex. */
+static gboolean sparse_cache_view(SparseCache *sc, uint64_t offset,
                                   const uint8_t **out_ptr, size_t *out_avail) {
-  if (!http_tail_window_contains(conn, offset, 1)) {
-    return false;
-  }
-  size_t local_off = (size_t)(offset - conn->tail_window_offset);
-  *out_ptr = conn->tail_window_data + local_off;
-  *out_avail = conn->tail_window_len - local_off;
-  return true;
+  guint idx = sparse_cache_find(sc, offset);
+  if (idx >= sc->count) return FALSE;
+  CachedRegion *r = &sc->regions[idx];
+  if (offset < r->offset || offset >= r->offset + r->len) return FALSE;
+  size_t local_off = (size_t)(offset - r->offset);
+  *out_ptr = r->data + local_off;
+  *out_avail = r->len - local_off;
+  r->last_access = g_get_monotonic_time();
+  return TRUE;
 }
 
-static bool http_fill_tail_window(HttpConnection *conn, size_t want_bytes, GError **err) {
-  if (conn->file_size == 0) {
-    return true;
+static void sparse_cache_grow(SparseCache *sc) {
+  if (sc->count < sc->capacity) return;
+  guint new_cap = sc->capacity == 0 ? 16 : sc->capacity * 2;
+  if (new_cap > SC_MAX_REGIONS * 2) new_cap = SC_MAX_REGIONS * 2;
+  sc->regions = g_realloc(sc->regions, new_cap * sizeof(CachedRegion));
+  sc->capacity = new_cap;
+}
+
+/* Evict the least recently accessed region.  Returns bytes freed. */
+static size_t sparse_cache_evict_one(SparseCache *sc) {
+  if (sc->count == 0) return 0;
+
+  guint lru_idx = 0;
+  gint64 oldest = sc->regions[0].last_access;
+  for (guint i = 1; i < sc->count; i++) {
+    if (sc->regions[i].last_access < oldest) {
+      oldest = sc->regions[i].last_access;
+      lru_idx = i;
+    }
   }
 
-  size_t capped = MIN(want_bytes, (size_t) conn->file_size);
-  uint64_t tail_offset = conn->file_size - capped;
+  size_t freed = sc->regions[lru_idx].len;
+  g_free(sc->regions[lru_idx].data);
 
+  if (lru_idx + 1 < sc->count) {
+    memmove(&sc->regions[lru_idx], &sc->regions[lru_idx + 1],
+            (sc->count - lru_idx - 1) * sizeof(CachedRegion));
+  }
+  sc->count--;
+  sc->total_bytes -= freed;
+  return freed;
+}
+
+/* Insert [offset, offset+len) into the cache.
+ * TAKES OWNERSHIP of `data` — caller must NOT free it afterward.
+ * When the new range overlaps or is adjacent (within SC_MERGE_GAP_BYTES) to
+ * existing regions, they are merged into a single region.
+ * Must hold cache_mutex. */
+static void sparse_cache_insert(SparseCache *sc, uint64_t offset,
+                                uint8_t *data, size_t len) {
+  if (len == 0) {
+    g_free(data);
+    return;
+  }
+
+  gint64 now = g_get_monotonic_time();
+  uint64_t new_end = offset + len;
+
+  /* Find regions that overlap or are adjacent within merge gap */
+  guint merge_first = sc->count;
+  guint merge_last = 0;
+  gboolean found_merge = FALSE;
+
+  for (guint i = 0; i < sc->count; i++) {
+    uint64_t r_start = sc->regions[i].offset;
+    uint64_t r_end = r_start + sc->regions[i].len;
+
+    gboolean overlaps = (offset <= r_end + SC_MERGE_GAP_BYTES) &&
+                        (r_start <= new_end + SC_MERGE_GAP_BYTES);
+    if (overlaps) {
+      if (!found_merge) {
+        merge_first = i;
+        found_merge = TRUE;
+      }
+      merge_last = i + 1;
+    }
+  }
+
+  if (!found_merge) {
+    /* No overlap — evict if needed, then insert standalone region */
+    while (sc->max_bytes > 0 && sc->total_bytes + len > sc->max_bytes) {
+      if (sparse_cache_evict_one(sc) == 0) break;
+    }
+    while (sc->count >= SC_MAX_REGIONS) {
+      sparse_cache_evict_one(sc);
+    }
+
+    sparse_cache_grow(sc);
+
+    guint ins = 0;
+    while (ins < sc->count && sc->regions[ins].offset < offset) {
+      ins++;
+    }
+    if (ins < sc->count) {
+      memmove(&sc->regions[ins + 1], &sc->regions[ins],
+              (sc->count - ins) * sizeof(CachedRegion));
+    }
+
+    sc->regions[ins].offset = offset;
+    sc->regions[ins].len = len;
+    sc->regions[ins].data = data;
+    sc->regions[ins].last_access = now;
+    sc->count++;
+    sc->total_bytes += len;
+    return;
+  }
+
+  /* Fast path: new data fully contained within one existing region */
+  if (merge_last - merge_first == 1) {
+    CachedRegion *r = &sc->regions[merge_first];
+    if (r->offset <= offset && r->offset + r->len >= new_end) {
+      size_t local_off = (size_t)(offset - r->offset);
+      memcpy(r->data + local_off, data, len);
+      r->last_access = now;
+      g_free(data);
+      return;
+    }
+  }
+
+  /* General merge: compute merged range, allocate merged buffer */
+  uint64_t merged_start = MIN(offset, sc->regions[merge_first].offset);
+  uint64_t merged_end = new_end;
+  for (guint i = merge_first; i < merge_last; i++) {
+    uint64_t r_end = sc->regions[i].offset + sc->regions[i].len;
+    if (r_end > merged_end) merged_end = r_end;
+  }
+
+  size_t merged_len = (size_t)(merged_end - merged_start);
+  uint8_t *merged_data = g_malloc0(merged_len);
+
+  /* Copy existing regions into merged buffer first */
+  for (guint i = merge_first; i < merge_last; i++) {
+    size_t dst_off = (size_t)(sc->regions[i].offset - merged_start);
+    memcpy(merged_data + dst_off, sc->regions[i].data, sc->regions[i].len);
+    sc->total_bytes -= sc->regions[i].len;
+    g_free(sc->regions[i].data);
+  }
+
+  /* Copy new data on top (takes priority in overlapping areas) */
+  size_t new_dst_off = (size_t)(offset - merged_start);
+  memcpy(merged_data + new_dst_off, data, len);
+  g_free(data);
+
+  /* Replace merged regions with single merged region */
+  sc->regions[merge_first].offset = merged_start;
+  sc->regions[merge_first].len = merged_len;
+  sc->regions[merge_first].data = merged_data;
+  sc->regions[merge_first].last_access = now;
+
+  guint removed = merge_last - merge_first - 1;
+  if (removed > 0 && merge_last < sc->count) {
+    memmove(&sc->regions[merge_first + 1], &sc->regions[merge_last],
+            (sc->count - merge_last) * sizeof(CachedRegion));
+  }
+  sc->count -= removed;
+  sc->total_bytes += merged_len;
+
+  /* Evict if over limit */
+  while (sc->max_bytes > 0 && sc->total_bytes > sc->max_bytes && sc->count > 1) {
+    sparse_cache_evict_one(sc);
+  }
+}
+
+/* Find uncached gaps within [offset, offset+size).
+ * Returns number of gaps written to `gaps` array.
+ * Must hold cache_mutex. */
+static guint sparse_cache_find_gaps(SparseCache *sc, uint64_t offset, size_t size,
+                                    CacheGap *gaps, guint max_gaps) {
+  if (size == 0 || max_gaps == 0) return 0;
+
+  uint64_t end = offset + size;
+  uint64_t cursor = offset;
+  guint gap_count = 0;
+  guint idx = sparse_cache_find(sc, offset);
+
+  while (cursor < end && gap_count < max_gaps) {
+    /* Skip past any region that covers cursor */
+    while (idx < sc->count &&
+           sc->regions[idx].offset <= cursor &&
+           sc->regions[idx].offset + sc->regions[idx].len > cursor) {
+      cursor = sc->regions[idx].offset + sc->regions[idx].len;
+      idx++;
+    }
+    if (cursor >= end) break;
+
+    /* cursor is in a gap — find where the next region starts */
+    uint64_t gap_end = end;
+    if (idx < sc->count && sc->regions[idx].offset < gap_end) {
+      gap_end = sc->regions[idx].offset;
+    }
+
+    if (gap_end > cursor) {
+      gaps[gap_count].offset = cursor;
+      gaps[gap_count].len = (size_t)(gap_end - cursor);
+      gap_count++;
+    }
+    cursor = gap_end;
+  }
+
+  return gap_count;
+}
+
+/* ==============================
+ * In-Flight Fetch Dedup
+ *
+ * Prevents duplicate HTTP requests when multiple threads hit the same
+ * cache miss simultaneously.  A thread registers its fetch range before
+ * starting the download; other threads finding an overlapping range wait
+ * on the condition variable instead of issuing a redundant request.
+ * ============================== */
+
+/* Check if any in-flight fetch overlaps [offset, offset+len).
+ * If so, wait for it to complete and return TRUE (caller should re-check cache).
+ * Must hold cache_mutex. */
+static gboolean inflight_wait_if_overlapping(HttpConnection *conn,
+                                             uint64_t offset, size_t len) {
+  uint64_t req_end = offset + len;
+  for (int i = 0; i < MAX_INFLIGHT_RANGES; i++) {
+    if (conn->inflight[i].active) {
+      uint64_t inf_end = conn->inflight[i].offset + conn->inflight[i].len;
+      if (conn->inflight[i].offset < req_end && inf_end > offset) {
+        while (conn->inflight[i].active) {
+          g_cond_wait(&conn->inflight[i].cond, &conn->cache_mutex);
+        }
+        return TRUE;
+      }
+    }
+  }
+  return FALSE;
+}
+
+/* Register an in-flight fetch.  Returns slot index or -1 if no slot. */
+static int inflight_register(HttpConnection *conn, uint64_t offset, size_t len) {
+  for (int i = 0; i < MAX_INFLIGHT_RANGES; i++) {
+    if (!conn->inflight[i].active) {
+      conn->inflight[i].offset = offset;
+      conn->inflight[i].len = len;
+      conn->inflight[i].active = TRUE;
+      return i;
+    }
+  }
+  return -1;
+}
+
+/* Complete an in-flight fetch, waking all waiters. */
+static void inflight_complete(HttpConnection *conn, int slot) {
+  if (slot >= 0 && slot < MAX_INFLIGHT_RANGES) {
+    conn->inflight[slot].active = FALSE;
+    g_cond_broadcast(&conn->inflight[slot].cond);
+  }
+}
+
+/* ==============================
+ * Gap Coalescing + Adaptive Prefetch
+ * ============================== */
+
+/* Coalesce nearby gaps into fewer, larger gaps.
+ * Input: sorted array of gaps.  Returns new gap count. */
+static guint coalesce_gaps(CacheGap *gaps, guint count) {
+  if (count <= 1) return count;
+  guint out = 0;
+  for (guint i = 1; i < count; i++) {
+    uint64_t prev_end = gaps[out].offset + gaps[out].len;
+    uint64_t new_end = gaps[i].offset + gaps[i].len;
+    size_t span = (size_t)(new_end - gaps[out].offset);
+    size_t inter_gap = 0;
+    if (gaps[i].offset > prev_end) {
+      inter_gap = (size_t)(gaps[i].offset - prev_end);
+    }
+    if (inter_gap <= COALESCE_MAX_GAP && span <= COALESCE_MAX_SPAN) {
+      gaps[out].len = (size_t)(new_end - gaps[out].offset);
+    } else {
+      out++;
+      if (out != i) gaps[out] = gaps[i];
+    }
+  }
+  return out + 1;
+}
+
+/* Compute effective read-ahead size for a file handle at a given offset */
+static size_t compute_readahead(struct _openslide_http_file *file, uint64_t offset) {
+  if (!file) return AP_INITIAL_READAHEAD;
+  HttpConnection *conn = file->conn;
+  size_t base = file->readahead_size;
+
+  /* Near file start (metadata region): boost */
+  if (offset < 1024 * 1024) {
+    if (base < 2 * 1024 * 1024) base = 2 * 1024 * 1024;
+  }
+
+  /* Near file end: extend to cover remainder */
+  if (conn->file_size > 0 && offset + base + 4 * 1024 * 1024 >= conn->file_size) {
+    size_t to_end = (size_t)(conn->file_size - offset);
+    if (to_end > base) base = to_end;
+  }
+
+  return MIN(base, (size_t) AP_MAX_READAHEAD);
+}
+
+/* ==============================
+ * Cache-Miss Handler
+ *
+ * Central entry point for ensuring a byte range is cached.  Handles:
+ * 1. Fast-path cache hit
+ * 2. In-flight dedup (wait for overlapping fetch)
+ * 3. Adaptive read-ahead sizing
+ * 4. Gap discovery + coalescing
+ * 5. Minimum fetch size enforcement
+ * 6. Single or parallel HTTP fetch
+ * 7. Sparse cache insertion (with auto-merge)
+ * ============================== */
+
+static bool http_cache_ensure(HttpConnection *conn,
+                              struct _openslide_http_file *file,
+                              uint64_t offset, size_t size,
+                              GError **err) {
+  if (size == 0 || offset >= conn->file_size) return true;
+  size_t capped = MIN(size, (size_t)(conn->file_size - offset));
+
+retry:
   g_mutex_lock(&conn->cache_mutex);
-  /* Already have sufficient tail window */
-  if (conn->tail_window_data != NULL && conn->tail_window_len >= capped) {
+
+  /* Fast path: already cached */
+  if (sparse_cache_contains(&conn->cache, offset, capped)) {
     g_mutex_unlock(&conn->cache_mutex);
     return true;
   }
-  /* Front window already covers entire file */
-  if (conn->front_window_data && conn->front_window_len >= conn->file_size) {
-    g_mutex_unlock(&conn->cache_mutex);
-    return true;
-  }
-  /* Don't overlap: if front window covers the tail region, skip */
-  if (conn->front_window_data && tail_offset < conn->front_window_len) {
-    tail_offset = conn->front_window_len;
-    if (tail_offset >= conn->file_size) {
+
+  /* Wait if an in-flight fetch covers our range */
+  if (inflight_wait_if_overlapping(conn, offset, capped)) {
+    if (sparse_cache_contains(&conn->cache, offset, capped)) {
       g_mutex_unlock(&conn->cache_mutex);
       return true;
     }
-    capped = (size_t)(conn->file_size - tail_offset);
-  }
-  g_mutex_unlock(&conn->cache_mutex);
-
-  uint8_t *buffer = g_malloc(capped);
-  size_t written = 0;
-  if (!http_fetch_range(conn, tail_offset, capped, buffer, &written, NULL, err) ||
-      written == 0) {
-    g_free(buffer);
-    return false;
+    /* Data still not cached (fetch may have failed).  Fall through. */
   }
 
-  uint8_t *owned = g_realloc(buffer, written);
+  /* Compute read-ahead and extended range */
+  size_t readahead = compute_readahead(file, offset);
+  size_t fetch_size = capped > readahead ? capped : readahead;
+  uint64_t fetch_end = offset + fetch_size;
+  if (fetch_end > conn->file_size) fetch_end = conn->file_size;
+  fetch_size = (size_t)(fetch_end - offset);
 
-  g_mutex_lock(&conn->cache_mutex);
-  if (written > conn->tail_window_len || conn->tail_window_data == NULL) {
-    g_free(conn->tail_window_data);
-    conn->tail_window_data = owned;
-    conn->tail_window_len = written;
-    conn->tail_window_offset = tail_offset;
-    owned = NULL;
-  }
-  g_mutex_unlock(&conn->cache_mutex);
-
-  g_free(owned);
-  return true;
-}
-
-static void http_block_free(HttpBlock *b) {
-  if (!b) {
-    return;
-  }
-  g_free(b->data);
-  b->data = NULL;
-  if (b->lru_node) {
-    g_free(b->lru_node);
-    b->lru_node = NULL;
-  }
-  g_cond_clear(&b->fetch_cond);
-  g_free(b);
-}
-
-static void block_remove_locked(HttpConnection *conn, guint64 block_idx, HttpBlock *b) {
-  if (!b) {
-    return;
-  }
-  if (b->lru_node) {
-    lru_remove_node(conn, b->lru_node);
-  }
-  g_hash_table_remove(conn->block_map, GUINT_TO_POINTER(block_idx));
-  if (conn->cache_count > 0) {
-    conn->cache_count--;
-  }
-  http_block_free(b);
-}
-
-/* O(1) evict from tail */
-static void lru_evict(HttpConnection *conn) {
-  if (!conn->lru_tail) {
-    return;
-  }
-  guint64 idx = conn->lru_tail->block_idx;
-  HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
-  block_remove_locked(conn, idx, b);
-}
-
-static guint64 bytes_to_blocks(size_t bytes, const OpenslideHTTPConfig *cfg) {
-  if (bytes == 0) {
-    return 0;
-  }
-  return (bytes + cfg->block_size - 1) / cfg->block_size;
-}
-
-static guint64 extent_cap_end_block(HttpConnection *conn,
-                                    guint64 start_block,
-                                    guint64 requested_end_block) {
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
-  uint64_t start_offset = start_block * cfg->block_size;
-  guint64 file_last_block = conn->file_size == 0 ? 0 :
-    (guint64)((conn->file_size - 1) / cfg->block_size);
-
-  size_t max_bytes = HTTP_NORMAL_MAX_EXTENT_BYTES;
-  guint64 target_end = requested_end_block;
-
-  if (start_offset < HTTP_METADATA_WINDOW_BYTES) {
-    max_bytes = HTTP_METADATA_MAX_EXTENT_BYTES;
-    uint64_t metadata_end_offset = MIN((uint64_t) HTTP_METADATA_WINDOW_BYTES,
-                                       conn->file_size);
-    if (metadata_end_offset > 0) {
-      guint64 metadata_end_block = (metadata_end_offset - 1) / cfg->block_size;
-      if (metadata_end_block > target_end) {
-        target_end = metadata_end_block;
-      }
-    }
-  } else if (conn->file_size > 0 &&
-             start_offset + HTTP_TAIL_REGION_BYTES >= conn->file_size) {
-    /* Near end of file: allow larger extents to merge tail reads */
-    max_bytes = HTTP_TAIL_MAX_EXTENT_BYTES;
-    /* Extend target to end of file so tail reads merge into one request */
-    if (file_last_block > target_end) {
-      target_end = file_last_block;
-    }
-  }
-
-  guint64 max_blocks = bytes_to_blocks(max_bytes, cfg);
-  if (max_blocks > 0) {
-    guint64 capped = start_block + max_blocks - 1;
-    if (target_end > capped) {
-      target_end = capped;
-    }
-  }
-
-  if (target_end > file_last_block) {
-    target_end = file_last_block;
-  }
-  return target_end;
-}
-
-static gboolean block_is_ready_locked(HttpConnection *conn G_GNUC_UNUSED,
-                                      guint64 block_idx) {
-  HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(block_idx));
-  return b && b->state == BLOCK_STATE_READY && b->data != NULL;
-}
-
-static bool http_prefetch_missing_blocks(HttpConnection *conn,
-                                         guint64 start_block,
-                                         guint64 end_block,
-                                         GError **err);
-static void http_store_buffer_locked(HttpConnection *conn,
-                                     guint64 start_block,
-                                     const uint8_t *buffer,
-                                     size_t written);
-static void http_plan_prefetch_blocks(HttpConnection *conn,
-                                      uint64_t offset,
-                                      size_t to_read,
-                                      guint64 *io_start_block,
-                                      guint64 *io_end_block);
-static size_t http_copy_cached_bytes(HttpConnection *conn,
-                                     uint64_t offset,
-                                     uint8_t *dst,
-                                     size_t to_read,
-                                     GError **err);
-
-/* ==============================
- * Extent Merge: Fetch multiple consecutive missing blocks in one request
- * ============================== */
-
-/* Find missing blocks in range [start, end] and fetch them together */
-static bool http_fetch_extent(HttpConnection *conn,
-                              guint64 start_block, guint64 end_block,
-                              GError **err) {
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
-
-  end_block = extent_cap_end_block(conn, start_block, end_block);
-  if (end_block < start_block) {
-    return true;
-  }
-
-  /* Calculate byte range */
-  uint64_t start_offset = start_block * cfg->block_size;
-  uint64_t end_offset = (end_block + 1) * cfg->block_size;
-
-  if (start_offset >= conn->file_size) {
-    return true;  /* Nothing to fetch */
-  }
-  if (end_offset > conn->file_size) {
-    end_offset = conn->file_size;
-  }
-
-  size_t total_len = (size_t)(end_offset - start_offset);
-  if (total_len == 0) {
-    return true;
-  }
-
-  HTTP_LOG("[HTTP-EXTENT] Fetching blocks %" PRIu64 "-%" PRIu64 " (%zu bytes)\n",
-           start_block, end_block, total_len);
-
-  /* Reserve missing blocks up front so parallel readers wait instead of
-   * issuing duplicate single-block fetches. */
-  g_mutex_lock(&conn->cache_mutex);
-  for (guint64 idx = start_block; idx <= end_block; idx++) {
-    HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
-    if (!b) {
-      while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
-        lru_evict(conn);
-      }
-      b = g_new0(HttpBlock, 1);
-      g_cond_init(&b->fetch_cond);
-      lru_insert_front(conn, b, idx);
-      g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(idx), b);
-      conn->cache_count++;
-    }
-    if (b->state != BLOCK_STATE_READY) {
-      b->state = BLOCK_STATE_FETCHING;
-    }
-  }
-  g_mutex_unlock(&conn->cache_mutex);
-
-  /* Allocate buffer for entire extent */
-  uint8_t *buffer = g_malloc(total_len);
-  size_t written = 0;
-
-  if (!http_fetch_range(conn, start_offset, total_len, buffer, &written, NULL, err)) {
-    g_free(buffer);
-    /* Mark reserved blocks as failed and remove them */
-    g_mutex_lock(&conn->cache_mutex);
-    for (guint64 idx = start_block; idx <= end_block; idx++) {
-      HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
-      if (b && b->state == BLOCK_STATE_FETCHING) {
-        g_cond_broadcast(&b->fetch_cond);
-        block_remove_locked(conn, idx, b);
-      }
-    }
-    g_mutex_unlock(&conn->cache_mutex);
-    return false;
-  }
-
-  /* Split into blocks and cache them */
-  g_mutex_lock(&conn->cache_mutex);
-
-  for (guint64 idx = start_block; idx <= end_block; idx++) {
-    HttpBlock *existing = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
-    if (existing && existing->state == BLOCK_STATE_READY && existing->data != NULL) {
-      lru_promote(conn, existing);
-      continue;
-    }
-
-    uint64_t block_start = (idx - start_block) * cfg->block_size;
-    uint64_t block_end = block_start + cfg->block_size;
-    if (block_end > written) {
-      block_end = written;
-    }
-    if (block_start >= written) {
-      break;
-    }
-
-    size_t block_len = (size_t)(block_end - block_start);
-
-    HttpBlock *b = existing;
-    if (!b) {
-      b = g_new0(HttpBlock, 1);
-      g_cond_init(&b->fetch_cond);
-
-      while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
-        lru_evict(conn);
-      }
-
-      lru_insert_front(conn, b, idx);
-      g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(idx), b);
-      conn->cache_count++;
-    }
-
-    g_free(b->data);
-    b->data = g_malloc(block_len);
-    memcpy(b->data, buffer + block_start, block_len);
-    b->len = block_len;
-    b->state = BLOCK_STATE_READY;
-    lru_promote(conn, b);
-    g_cond_broadcast(&b->fetch_cond);
-  }
-
-  /* Any reserved blocks not populated by the returned range should be removed. */
-  for (guint64 idx = start_block; idx <= end_block; idx++) {
-    HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
-    if (!b) {
-      continue;
-    }
-    if (b->state == BLOCK_STATE_FETCHING) {
-      g_cond_broadcast(&b->fetch_cond);
-      block_remove_locked(conn, idx, b);
-    }
-  }
-
-  g_mutex_unlock(&conn->cache_mutex);
-  g_free(buffer);
-
-  return true;
-}
-
-/* Max disjoint gaps we will collect for parallel fetch */
-#define HTTP_MAX_PARALLEL_GAPS 8
-
-typedef struct {
-  guint64 start_block;
-  guint64 end_block;
-} BlockGap;
-
-static bool http_prefetch_missing_blocks(HttpConnection *conn,
-                                         guint64 start_block,
-                                         guint64 end_block,
-                                         GError **err) {
-  if (end_block < start_block) {
-    return true;
-  }
-
-  /* Phase 1: Collect all disjoint missing-block gaps */
-  BlockGap gaps[HTTP_MAX_PARALLEL_GAPS];
-  guint gap_count = 0;
-
-  guint64 idx = start_block;
-  while (idx <= end_block && gap_count < HTTP_MAX_PARALLEL_GAPS) {
-    guint64 miss_start = G_MAXUINT64;
-    guint64 miss_end = 0;
-
-    g_mutex_lock(&conn->cache_mutex);
-    while (idx <= end_block && block_is_ready_locked(conn, idx)) {
-      idx++;
-    }
-    if (idx <= end_block) {
-      miss_start = idx;
-      miss_end = idx;
-      while (miss_end + 1 <= end_block && !block_is_ready_locked(conn, miss_end + 1)) {
-        miss_end++;
-      }
-    }
-    g_mutex_unlock(&conn->cache_mutex);
-
-    if (miss_start == G_MAXUINT64) {
-      break;
-    }
-
-    /* Apply extent cap to this gap */
-    miss_end = extent_cap_end_block(conn, miss_start, miss_end);
-    if (miss_end >= miss_start) {
-      gaps[gap_count].start_block = miss_start;
-      gaps[gap_count].end_block = miss_end;
-      gap_count++;
-    }
-
-    idx = miss_end + 1;
-  }
-
+  /* Find gaps in the extended range */
+  CacheGap gaps[COALESCE_MAX_RANGES];
+  guint gap_count = sparse_cache_find_gaps(&conn->cache, offset, fetch_size,
+                                           gaps, COALESCE_MAX_RANGES);
   if (gap_count == 0) {
+    g_mutex_unlock(&conn->cache_mutex);
     return true;
   }
 
-  /* Phase 2: Single gap — use existing serial path */
+  /* Coalesce nearby gaps */
+  gap_count = coalesce_gaps(gaps, gap_count);
+
+  /* Enforce minimum fetch size per gap */
+  for (guint i = 0; i < gap_count; i++) {
+    if (gaps[i].len < SC_MIN_FETCH_BYTES) {
+      uint64_t gap_end = gaps[i].offset + SC_MIN_FETCH_BYTES;
+      if (gap_end > conn->file_size) gap_end = conn->file_size;
+      gaps[i].len = (size_t)(gap_end - gaps[i].offset);
+    }
+  }
+
+  /* Register in-flight ranges */
+  int inflight_slots[COALESCE_MAX_RANGES];
+  for (guint i = 0; i < gap_count; i++) {
+    inflight_slots[i] = inflight_register(conn, gaps[i].offset, gaps[i].len);
+  }
+
+  g_mutex_unlock(&conn->cache_mutex);
+
+  /* --- Network I/O (no cache lock held) --- */
+
+  bool ok = true;
+
   if (gap_count == 1) {
-    return http_fetch_extent(conn, gaps[0].start_block, gaps[0].end_block, err);
-  }
-
-  /* Phase 3: Multiple gaps — fetch all ranges in parallel */
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
-
-  uint64_t offsets[HTTP_MAX_PARALLEL_GAPS];
-  size_t   lens[HTTP_MAX_PARALLEL_GAPS];
-  uint8_t *buffers[HTTP_MAX_PARALLEL_GAPS];
-
-  for (guint i = 0; i < gap_count; i++) {
-    uint64_t start_off = gaps[i].start_block * cfg->block_size;
-    uint64_t end_off   = (gaps[i].end_block + 1) * (uint64_t) cfg->block_size;
-    if (start_off >= conn->file_size) {
-      lens[i] = 0;
-      buffers[i] = NULL;
-      continue;
-    }
-    if (end_off > conn->file_size) {
-      end_off = conn->file_size;
-    }
-    offsets[i] = start_off;
-    lens[i]    = (size_t)(end_off - start_off);
-    buffers[i] = g_malloc(lens[i]);
-
-    /* Reserve blocks as FETCHING so other threads wait */
-    g_mutex_lock(&conn->cache_mutex);
-    for (guint64 bi = gaps[i].start_block; bi <= gaps[i].end_block; bi++) {
-      HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(bi));
-      if (!b) {
-        while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
-          lru_evict(conn);
-        }
-        b = g_new0(HttpBlock, 1);
-        g_cond_init(&b->fetch_cond);
-        lru_insert_front(conn, b, bi);
-        g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(bi), b);
-        conn->cache_count++;
-      }
-      if (b->state != BLOCK_STATE_READY) {
-        b->state = BLOCK_STATE_FETCHING;
-      }
-    }
-    g_mutex_unlock(&conn->cache_mutex);
-  }
-
-  HTTP_LOG("[HTTP-PARALLEL] Fetching %u gaps concurrently\n", gap_count);
-  bool ok = http_fetch_parallel(conn, offsets, lens, buffers, gap_count, err);
-
-  /* Phase 4: Store fetched data into block cache */
-  g_mutex_lock(&conn->cache_mutex);
-  for (guint i = 0; i < gap_count; i++) {
-    if (!buffers[i] || lens[i] == 0) {
-      continue;
-    }
-    if (ok) {
-      http_store_buffer_locked(conn, gaps[i].start_block, buffers[i], lens[i]);
-    } else {
-      /* Mark reserved blocks as failed */
-      for (guint64 bi = gaps[i].start_block; bi <= gaps[i].end_block; bi++) {
-        HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(bi));
-        if (b && b->state == BLOCK_STATE_FETCHING) {
-          g_cond_broadcast(&b->fetch_cond);
-          block_remove_locked(conn, bi, b);
-        }
-      }
-    }
-  }
-  g_mutex_unlock(&conn->cache_mutex);
-
-  for (guint i = 0; i < gap_count; i++) {
-    g_free(buffers[i]);
-  }
-
-  return ok;
-}
-
-static void http_plan_prefetch_blocks(HttpConnection *conn,
-                                      uint64_t offset,
-                                      size_t to_read,
-                                      guint64 *io_start_block,
-                                      guint64 *io_end_block) {
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
-  guint64 start_block = *io_start_block;
-  guint64 end_block = *io_end_block;
-
-  if (to_read == 0 || conn->file_size == 0) {
-    return;
-  }
-
-  if (offset < HTTP_METADATA_WINDOW_BYTES) {
-    guint64 metadata_end = MIN((uint64_t) HTTP_METADATA_WINDOW_BYTES,
-                               conn->file_size);
-    if (metadata_end > 0) {
-      guint64 metadata_end_block = (metadata_end - 1) / cfg->block_size;
-      if (end_block < metadata_end_block) {
-        end_block = metadata_end_block;
-      }
-    }
-  } else if (to_read <= HTTP_SMALL_READ_THRESHOLD_BYTES) {
-    guint64 extra_end_offset = MIN(offset + to_read + HTTP_SMALL_READ_AHEAD_BYTES,
-                                   conn->file_size);
-    if (extra_end_offset > 0) {
-      guint64 extra_end_block = (extra_end_offset - 1) / cfg->block_size;
-      if (end_block < extra_end_block) {
-        end_block = extra_end_block;
-      }
-    }
-  }
-
-  *io_start_block = start_block;
-  *io_end_block = end_block;
-}
-
-static size_t http_copy_cached_bytes(HttpConnection *conn,
-                                     uint64_t offset,
-                                     uint8_t *dst,
-                                     size_t to_read,
-                                     GError **err) {
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
-  size_t total = 0;
-
-  while (total < to_read) {
-    guint64 block_idx = (offset + total) / cfg->block_size;
-    uint32_t block_off = (offset + total) % cfg->block_size;
-
-    HttpBlock *b = http_get_block(conn, block_idx, err);
-    if (!b || !b->data) {
-      break;
-    }
-    if (block_off >= b->len) {
-      break;
-    }
-
-    size_t copy_len = MIN(to_read - total, b->len - block_off);
-    memcpy(dst + total, b->data + block_off, copy_len);
-    total += copy_len;
-  }
-
-  return total;
-}
-
-/* ==============================
- * Block Fetch with In-Flight Deduplication
- * ============================== */
-
-static HttpBlock *http_get_block(HttpConnection *conn,
-                                 guint64 block_idx, GError **err) {
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
-
-  g_mutex_lock(&conn->cache_mutex);
-
-  /* Check if block exists */
-  HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(block_idx));
-  
-  if (b) {
-    if (b->state == BLOCK_STATE_READY) {
-      /* Cache hit - promote and return */
-      stats_record_cache(TRUE);
-      lru_promote(conn, b);
+    /* Single gap: direct fetch */
+    uint8_t *buf = g_malloc(gaps[0].len);
+    size_t written = 0;
+    ok = http_fetch_range(conn, gaps[0].offset, gaps[0].len,
+                          buf, &written, NULL, err);
+    if (ok && written > 0) {
+      buf = g_realloc(buf, written);
+      g_mutex_lock(&conn->cache_mutex);
+      sparse_cache_insert(&conn->cache, gaps[0].offset, buf, written);
       g_mutex_unlock(&conn->cache_mutex);
-      return b;
-    } else if (b->state == BLOCK_STATE_FETCHING) {
-      /* Another thread is fetching - wait for it */
-      while (b->state == BLOCK_STATE_FETCHING) {
-        g_cond_wait(&b->fetch_cond, &conn->cache_mutex);
-      }
-      if (b->state == BLOCK_STATE_READY) {
-        stats_record_cache(TRUE);
-        lru_promote(conn, b);
-        g_mutex_unlock(&conn->cache_mutex);
-        return b;
-      }
-      /* Fetch failed and the entry may already have been removed. */
-      b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(block_idx));
-      if (!b) {
-        /* Fall through and recreate a clean placeholder. */
-      }
+      buf = NULL;  /* ownership transferred */
     }
-  }
+    g_free(buf);
+  } else {
+    /* Multiple gaps: parallel fetch */
+    uint64_t offsets[COALESCE_MAX_RANGES];
+    size_t   lens[COALESCE_MAX_RANGES];
+    uint8_t *buffers[COALESCE_MAX_RANGES];
 
-  /* Cache miss - create placeholder and mark as fetching */
-  stats_record_cache(FALSE);
-  
-  if (!b) {
-    b = g_new0(HttpBlock, 1);
-    g_cond_init(&b->fetch_cond);
-    
-    /* Evict if needed */
-    while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
-      lru_evict(conn);
+    for (guint i = 0; i < gap_count; i++) {
+      offsets[i] = gaps[i].offset;
+      lens[i] = gaps[i].len;
+      buffers[i] = g_malloc(gaps[i].len);
     }
-    
-    lru_insert_front(conn, b, block_idx);
-    g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(block_idx), b);
-    conn->cache_count++;
-  }
-  
-  b->state = BLOCK_STATE_FETCHING;
-  g_mutex_unlock(&conn->cache_mutex);
 
-  /* Fetch data outside lock */
-  uint64_t offset = block_idx * cfg->block_size;
-  size_t len = cfg->block_size;
-  
-  if (offset >= conn->file_size) {
+    ok = http_fetch_parallel(conn, offsets, lens, buffers, gap_count, err);
+
     g_mutex_lock(&conn->cache_mutex);
-    g_cond_broadcast(&b->fetch_cond);
-    block_remove_locked(conn, block_idx, b);
+    for (guint i = 0; i < gap_count; i++) {
+      if (ok && buffers[i]) {
+        sparse_cache_insert(&conn->cache, offsets[i], buffers[i], lens[i]);
+        buffers[i] = NULL;  /* ownership transferred */
+      }
+      g_free(buffers[i]);
+    }
     g_mutex_unlock(&conn->cache_mutex);
-    return NULL;
-  }
-  if (offset + len > conn->file_size) {
-    len = (size_t)(conn->file_size - offset);
   }
 
-  uint8_t *data = g_malloc(len);
-  size_t written = 0;
-  
-  if (!http_fetch_range(conn, offset, len, data, &written, NULL, err) || written == 0) {
-    g_free(data);
-    g_mutex_lock(&conn->cache_mutex);
-    g_cond_broadcast(&b->fetch_cond);
-    block_remove_locked(conn, block_idx, b);
-    g_mutex_unlock(&conn->cache_mutex);
-    return NULL;
-  }
-
-  /* Store data and signal waiters */
+  /* Complete in-flight ranges */
   g_mutex_lock(&conn->cache_mutex);
-  /* Free old data if any (shouldn't happen but be safe) */
-  if (b->data) {
-    g_free(b->data);
+  for (guint i = 0; i < gap_count; i++) {
+    inflight_complete(conn, inflight_slots[i]);
   }
-  b->data = data;
-  b->len = written;
-  b->state = BLOCK_STATE_READY;
-  lru_promote(conn, b);
-  g_cond_broadcast(&b->fetch_cond);
   g_mutex_unlock(&conn->cache_mutex);
 
-  return b;
+  if (!ok) return false;
+
+  /* Verify the originally requested range is now cached.
+   * It could still be missing if we only partially fetched. */
+  g_mutex_lock(&conn->cache_mutex);
+  gboolean covered = sparse_cache_contains(&conn->cache, offset, capped);
+  g_mutex_unlock(&conn->cache_mutex);
+  if (!covered) {
+    /* Shouldn't normally happen, but retry once. */
+    static volatile gint retry_guard = 0;
+    if (g_atomic_int_add(&retry_guard, 1) == 0) {
+      g_atomic_int_set(&retry_guard, 0);
+      goto retry;
+    }
+    g_atomic_int_set(&retry_guard, 0);
+    g_set_error(err, OPENSLIDE_ERROR, OPENSLIDE_ERROR_FAILED,
+                "Cache miss persists after fetch for %s at offset %" PRIu64,
+                conn->uri, offset);
+    return false;
+  }
+
+  return true;
 }
 
 /* ==============================
@@ -2080,28 +1835,15 @@ static void http_connection_destroy(HttpConnection *conn) {
   }
   g_mutex_unlock(&conn->curl_mutex);
 
-  /* Free cache */
+  /* Free sparse cache */
   g_mutex_lock(&conn->cache_mutex);
-  if (conn->block_map) {
-    GHashTableIter iter;
-    gpointer key, value;
-    g_hash_table_iter_init(&iter, conn->block_map);
-    while (g_hash_table_iter_next(&iter, &key, &value)) {
-      http_block_free((HttpBlock *)value);
-    }
-    g_hash_table_destroy(conn->block_map);
-    conn->block_map = NULL;
-  }
-  g_free(conn->front_window_data);
-  conn->front_window_data = NULL;
-  conn->front_window_len = 0;
-  g_free(conn->tail_window_data);
-  conn->tail_window_data = NULL;
-  conn->tail_window_len = 0;
-  conn->tail_window_offset = 0;
-  conn->lru_head = NULL;
-  conn->lru_tail = NULL;
+  sparse_cache_destroy(&conn->cache);
   g_mutex_unlock(&conn->cache_mutex);
+
+  /* Free inflight conds */
+  for (int i = 0; i < MAX_INFLIGHT_RANGES; i++) {
+    g_cond_clear(&conn->inflight[i].cond);
+  }
 
   g_free(conn->uri);
   conn->uri = NULL;
@@ -2141,7 +1883,6 @@ static void http_connection_unref(HttpConnection *conn) {
       g_mutex_unlock(&pool_mutex);
 
 #if HTTP_STATS
-      /* Print per-connection stats */
       gint reqs = g_atomic_int_get(&conn->range_requests);
       gint bytes_kb = g_atomic_int_get(&conn->range_bytes_kb);
       gint time_ms = g_atomic_int_get(&conn->range_time_ms);
@@ -2159,95 +1900,102 @@ static void http_connection_unref(HttpConnection *conn) {
   g_mutex_unlock(&pool_mutex);
 }
 
-
-static void http_store_buffer_locked(HttpConnection *conn,
-                                     guint64 start_block,
-                                     const uint8_t *buffer,
-                                     size_t written) {
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
-  if (written == 0) {
-    return;
-  }
-
-  guint64 end_block = start_block + (guint64) ((written - 1) / cfg->block_size);
-  for (guint64 idx = start_block; idx <= end_block; idx++) {
-    size_t block_start = (size_t) ((idx - start_block) * cfg->block_size);
-    size_t block_end = block_start + cfg->block_size;
-    if (block_end > written) {
-      block_end = written;
-    }
-    if (block_start >= written) {
-      break;
-    }
-
-    HttpBlock *b = g_hash_table_lookup(conn->block_map, GUINT_TO_POINTER(idx));
-    if (!b) {
-      while (cfg->max_cache_blocks > 0 && conn->cache_count >= cfg->max_cache_blocks) {
-        lru_evict(conn);
-      }
-      b = g_new0(HttpBlock, 1);
-      g_cond_init(&b->fetch_cond);
-      lru_insert_front(conn, b, idx);
-      g_hash_table_insert(conn->block_map, GUINT_TO_POINTER(idx), b);
-      conn->cache_count++;
-    }
-
-    size_t block_len = block_end - block_start;
-    g_free(b->data);
-    b->data = g_malloc(block_len);
-    memcpy(b->data, buffer + block_start, block_len);
-    b->len = block_len;
-    b->state = BLOCK_STATE_READY;
-    lru_promote(conn, b);
-    g_cond_broadcast(&b->fetch_cond);
-  }
-}
-
-/* Prime connection by issuing one real range GET for the first chunk.
- * This both discovers file size and warms the cache for metadata / DZI. */
-static bool http_prime_connection(HttpConnection *conn, uint64_t *out_size, GError **err) {
-  if (!http_fill_front_window(conn, HTTP_FRONT_WINDOW_BYTES, err)) {
-    return false;
-  }
-
-  g_mutex_lock(&conn->cache_mutex);
-  *out_size = conn->file_size > 0 ? conn->file_size : conn->front_window_len;
-  g_mutex_unlock(&conn->cache_mutex);
-
-  /* Prefetch tail window for TIFF IFD / strip-offset reads near end of file.
-   * This is opportunistic: failure does not block opening. */
-  if (*out_size > (uint64_t) HTTP_FRONT_WINDOW_BYTES) {
-    GError *tail_err = NULL;
-    if (!http_fill_tail_window(conn, HTTP_TAIL_WINDOW_BYTES, &tail_err)) {
-      HTTP_LOG("[HTTP-PRIME] tail prefetch failed: %s\n",
-               tail_err ? tail_err->message : "unknown");
-      g_clear_error(&tail_err);
-    }
-  }
-
-  HTTP_LOG("[HTTP-PRIME] %s size=%" PRIu64 " front_window=%zuB tail_window=%zuB\n",
-           conn->uri, *out_size, conn->front_window_len, conn->tail_window_len);
-  return *out_size > 0;
-}
-
 static HttpConnection *http_connection_create(const char *uri, GError **err G_GNUC_UNUSED) {
   HttpConnection *conn = g_new0(HttpConnection, 1);
   conn->uri = g_strdup(uri);
   conn->ref_count = 1;
   conn->last_used_us = g_get_monotonic_time();
   conn->state = CONN_STATE_INIT;
-  
+
   g_mutex_init(&conn->mutex);
   g_mutex_init(&conn->cache_mutex);
   g_mutex_init(&conn->curl_mutex);
   g_cond_init(&conn->state_cond);
-  
-  conn->block_map = g_hash_table_new(g_direct_hash, g_direct_equal);
-  conn->lru_head = NULL;
-  conn->lru_tail = NULL;
-  
+
+  sparse_cache_init(&conn->cache, SC_MAX_BYTES_DEFAULT);
+
+  for (int i = 0; i < MAX_INFLIGHT_RANGES; i++) {
+    g_cond_init(&conn->inflight[i].cond);
+  }
+
   return conn;
 }
+
+/* ==============================
+ * Connection Priming
+ *
+ * On first connection to a URI, fetch the front window (first N bytes)
+ * and tail window (last N bytes) into the sparse cache.  The front
+ * fetch also discovers the total file size via the Content-Range header.
+ * Window sizes adapt to file size for large slides.
+ * ============================== */
+
+static bool http_prime_connection(HttpConnection *conn, uint64_t *out_size, GError **err) {
+  /* Step 1: Fetch front window (discovers file size) */
+  size_t front_want = PRIME_FRONT_BYTES;
+  uint8_t *front_buf = g_malloc(front_want);
+  size_t front_written = 0;
+  uint64_t discovered_size = 0;
+
+  if (!http_fetch_range(conn, 0, front_want, front_buf, &front_written,
+                        &discovered_size, err) || front_written == 0) {
+    g_free(front_buf);
+    return false;
+  }
+
+  if (discovered_size > 0) {
+    conn->file_size = discovered_size;
+  } else {
+    conn->file_size = front_written;
+  }
+  *out_size = conn->file_size;
+
+  /* Insert front data into sparse cache (takes ownership) */
+  front_buf = g_realloc(front_buf, front_written);
+  g_mutex_lock(&conn->cache_mutex);
+  sparse_cache_insert(&conn->cache, 0, front_buf, front_written);
+  g_mutex_unlock(&conn->cache_mutex);
+  /* front_buf ownership transferred — do not free */
+
+  /* Step 2: Fetch tail window (adaptive size based on file_size) */
+  if (conn->file_size > (uint64_t) front_written) {
+    size_t tail_want = PRIME_TAIL_BYTES;
+    size_t adaptive = (size_t)(conn->file_size / PRIME_ADAPTIVE_DIVISOR);
+    if (adaptive > PRIME_ADAPTIVE_MAX) adaptive = PRIME_ADAPTIVE_MAX;
+    if (adaptive > tail_want) tail_want = adaptive;
+
+    uint64_t tail_offset = conn->file_size > tail_want
+                           ? conn->file_size - tail_want : 0;
+    if (tail_offset < front_written) tail_offset = front_written;
+
+    if (tail_offset < conn->file_size) {
+      tail_want = (size_t)(conn->file_size - tail_offset);
+      uint8_t *tail_buf = g_malloc(tail_want);
+      size_t tail_written = 0;
+      GError *tail_err = NULL;
+
+      if (http_fetch_range(conn, tail_offset, tail_want, tail_buf,
+                           &tail_written, NULL, &tail_err) && tail_written > 0) {
+        tail_buf = g_realloc(tail_buf, tail_written);
+        g_mutex_lock(&conn->cache_mutex);
+        sparse_cache_insert(&conn->cache, tail_offset, tail_buf, tail_written);
+        g_mutex_unlock(&conn->cache_mutex);
+        /* tail_buf ownership transferred */
+      } else {
+        g_free(tail_buf);
+        g_clear_error(&tail_err);
+      }
+    }
+  }
+
+  HTTP_LOG("[HTTP-PRIME] %s size=%" PRIu64 " cache_regions=%u cached=%zuB\n",
+           conn->uri, conn->file_size, conn->cache.count, conn->cache.total_bytes);
+  return true;
+}
+
+/* ==============================
+ * Connection Pool Lookup
+ * ============================== */
 
 /* Fast path: pool hit with READY connection, no expired scan */
 static HttpConnection *http_connection_get_fast(const char *uri) {
@@ -2276,29 +2024,27 @@ static HttpConnection *http_connection_get_or_create(const char *uri, GError **e
   ensure_pool_mutex_init();
   _openslide_http_init();
 
-  /* Quick check with pool lock */
   g_mutex_lock(&pool_mutex);
 
-  /* Throttled expired scan: only run once per interval */
+  /* Throttled expired scan */
   GList *expired = NULL;
   gint64 now_us = g_get_monotonic_time();
   if (now_us - last_expired_scan_us >= HTTP_EXPIRED_SCAN_INTERVAL_US) {
     expired = http_pool_collect_expired_locked();
     last_expired_scan_us = now_us;
   }
-  
+
   HttpConnection *conn = conn_pool ? g_hash_table_lookup(conn_pool, uri) : NULL;
-  
+
   if (conn) {
     g_mutex_lock(&conn->mutex);
-    
-    /* Wait if another thread is connecting */
+
     while (conn->state == CONN_STATE_CONNECTING) {
       g_mutex_unlock(&pool_mutex);
       g_cond_wait(&conn->state_cond, &conn->mutex);
       g_mutex_lock(&pool_mutex);
     }
-    
+
     if (conn->state == CONN_STATE_READY) {
       conn->ref_count++;
       conn->last_used_us = g_get_monotonic_time();
@@ -2309,7 +2055,7 @@ static HttpConnection *http_connection_get_or_create(const char *uri, GError **e
       http_destroy_connection_list(expired);
       return conn;
     }
-    
+
     if (conn->state == CONN_STATE_CLOSING) {
       g_mutex_unlock(&conn->mutex);
       g_mutex_unlock(&pool_mutex);
@@ -2318,29 +2064,29 @@ static HttpConnection *http_connection_get_or_create(const char *uri, GError **e
                   "Connection is closing for %s", uri);
       return NULL;
     }
-    
+
     /* Error state - remove and retry */
     g_mutex_unlock(&conn->mutex);
     g_hash_table_remove(conn_pool, uri);
     conn = NULL;
   }
 
-  /* Create new connection placeholder */
+  /* Create new connection */
   conn = http_connection_create(uri, err);
   if (!conn) {
     g_mutex_unlock(&pool_mutex);
     http_destroy_connection_list(expired);
     return NULL;
   }
-  
+
   conn->state = CONN_STATE_CONNECTING;
   conn->last_used_us = g_get_monotonic_time();
   g_hash_table_insert(conn_pool, g_strdup(uri), conn);
-  
+
   g_mutex_unlock(&pool_mutex);
   http_destroy_connection_list(expired);
 
-  /* Do network operation OUTSIDE pool_mutex */
+  /* Network I/O outside pool_mutex */
   uint64_t file_size = 0;
   bool size_ok = http_prime_connection(conn, &file_size, err);
 
@@ -2371,10 +2117,9 @@ static HttpConnection *http_connection_get_or_create(const char *uri, GError **e
 
 struct _openslide_http_file *_openslide_http_open(const char *uri,
                                                    GError **err) {
-  /* Fast path: reuse existing READY connection without expired scan */
+  /* Fast path: reuse existing READY connection */
   HttpConnection *conn = http_connection_get_fast(uri);
   if (!conn) {
-    /* Slow path: full init + expired scan + create + prime */
     conn = http_connection_get_or_create(uri, err);
   }
   if (!conn) {
@@ -2385,8 +2130,8 @@ struct _openslide_http_file *_openslide_http_open(const char *uri,
   file->conn = conn;
   file->position = 0;
   file->last_read_end = -1;
-  file->last_block_idx = G_MAXUINT64;
-  file->sequential_hits = 0;
+  file->sequential_count = 0;
+  file->readahead_size = AP_INITIAL_READAHEAD;
 
   return file;
 }
@@ -2442,94 +2187,9 @@ const char *_openslide_http_get_uri(struct _openslide_http_file *file) {
   return file ? file->conn->uri : NULL;
 }
 
-static bool http_get_request_block_range(HttpConnection *conn,
-                                         uint64_t offset,
-                                         size_t size,
-                                         guint64 *out_start_block,
-                                         guint64 *out_end_block,
-                                         size_t *out_to_read) {
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
-  if (offset >= conn->file_size) {
-    if (out_to_read) {
-      *out_to_read = 0;
-    }
-    return false;
-  }
-
-  size_t to_read = MIN(size, (size_t) (conn->file_size - offset));
-  if (to_read == 0) {
-    if (out_to_read) {
-      *out_to_read = 0;
-    }
-    return false;
-  }
-
-  if (out_start_block) {
-    *out_start_block = offset / cfg->block_size;
-  }
-  if (out_end_block) {
-    *out_end_block = (offset + to_read - 1) / cfg->block_size;
-  }
-  if (out_to_read) {
-    *out_to_read = to_read;
-  }
-  return true;
-}
-
-static bool http_ensure_cached_range(HttpConnection *conn,
-                                     uint64_t offset,
-                                     size_t size,
-                                     GError **err,
-                                     size_t *out_to_read) {
-  guint64 start_block = 0, end_block = 0;
-  size_t to_read = 0;
-  if (!http_get_request_block_range(conn, offset, size,
-                                    &start_block, &end_block, &to_read)) {
-    if (out_to_read) {
-      *out_to_read = 0;
-    }
-    return true;
-  }
-
-  /* Check front window */
-  if (offset < HTTP_FRONT_WINDOW_MAX_BYTES) {
-    uint64_t request_end = offset + to_read;
-    size_t want = HTTP_FRONT_WINDOW_BYTES;
-    if (request_end > want) {
-      want = (size_t) MIN((uint64_t) HTTP_FRONT_WINDOW_MAX_BYTES, request_end);
-    }
-    if (!http_fill_front_window(conn, want, err)) {
-      return false;
-    }
-    g_mutex_lock(&conn->cache_mutex);
-    gboolean covered = http_front_window_contains(conn, offset, to_read);
-    g_mutex_unlock(&conn->cache_mutex);
-    if (covered) {
-      if (out_to_read) {
-        *out_to_read = to_read;
-      }
-      return true;
-    }
-  }
-
-  /* Check tail window */
-  g_mutex_lock(&conn->cache_mutex);
-  gboolean tail_covered = http_tail_window_contains(conn, offset, to_read);
-  g_mutex_unlock(&conn->cache_mutex);
-  if (tail_covered) {
-    if (out_to_read) {
-      *out_to_read = to_read;
-    }
-    return true;
-  }
-
-  http_plan_prefetch_blocks(conn, offset, to_read, &start_block, &end_block);
-
-  if (out_to_read) {
-    *out_to_read = to_read;
-  }
-  return http_prefetch_missing_blocks(conn, start_block, end_block, err);
-}
+/* ==============================
+ * Public Read API
+ * ============================== */
 
 size_t _openslide_http_read(struct _openslide_http_file *file,
                             void *buf, size_t size, GError **err) {
@@ -2538,39 +2198,53 @@ size_t _openslide_http_read(struct _openslide_http_file *file,
   }
 
   HttpConnection *conn = file->conn;
+  uint64_t pos = (uint64_t) file->position;
+
+  if (pos >= conn->file_size) {
+    return 0;
+  }
+  size_t to_read = MIN(size, (size_t)(conn->file_size - pos));
+
+  /* Update adaptive prefetch state */
+  if (file->last_read_end >= 0 && pos == (uint64_t) file->last_read_end) {
+    file->sequential_count++;
+    if (file->sequential_count >= AP_SEQ_THRESHOLD) {
+      size_t new_ra = file->readahead_size * 2;
+      if (new_ra > AP_MAX_READAHEAD) new_ra = AP_MAX_READAHEAD;
+      file->readahead_size = new_ra;
+    }
+  } else {
+    file->sequential_count = 0;
+    file->readahead_size = AP_INITIAL_READAHEAD;
+  }
+
+  /* Ensure data is cached */
+  if (!http_cache_ensure(conn, file, pos, to_read, err)) {
+    return 0;
+  }
+
+  /* Copy from sparse cache */
   uint8_t *dst = (uint8_t *) buf;
-
-  int64_t pos = file->position;
-  size_t to_read = 0;
-  if (!http_ensure_cached_range(conn, (uint64_t) pos, size, err, &to_read)) {
-    return 0;
-  }
-  if (to_read == 0) {
-    return 0;
-  }
-
   size_t total = 0;
+
   g_mutex_lock(&conn->cache_mutex);
-  if (http_front_window_contains(conn, (uint64_t) pos, to_read)) {
-    memcpy(dst, conn->front_window_data + pos, to_read);
-    total = to_read;
-  } else if (http_tail_window_contains(conn, (uint64_t) pos, to_read)) {
-    size_t local_off = (size_t)((uint64_t) pos - conn->tail_window_offset);
-    memcpy(dst, conn->tail_window_data + local_off, to_read);
-    total = to_read;
+  while (total < to_read) {
+    const uint8_t *ptr;
+    size_t avail;
+    if (!sparse_cache_view(&conn->cache, pos + total, &ptr, &avail)) {
+      break;
+    }
+    size_t copy = MIN(avail, to_read - total);
+    memcpy(dst + total, ptr, copy);
+    total += copy;
   }
   g_mutex_unlock(&conn->cache_mutex);
-
-  if (total == 0) {
-    total = http_copy_cached_bytes(conn, (uint64_t) pos, dst, to_read, err);
-  }
 
   file->position += (int64_t) total;
   file->last_read_end = file->position;
   return total;
 }
 
-/* Read exact number of bytes, error if less */
 bool _openslide_http_read_exact(struct _openslide_http_file *file,
                                 void *buf, size_t size, GError **err) {
   size_t n = _openslide_http_read(file, buf, size, err);
@@ -2584,7 +2258,6 @@ bool _openslide_http_read_exact(struct _openslide_http_file *file,
   return true;
 }
 
-/* Zero-copy pread */
 size_t _openslide_http_pread(struct _openslide_http_file *file,
                              uint64_t offset, void *buf, size_t size,
                              GError **err) {
@@ -2593,34 +2266,35 @@ size_t _openslide_http_pread(struct _openslide_http_file *file,
   }
 
   HttpConnection *conn = file->conn;
-  uint8_t *dst = (uint8_t *) buf;
 
-  size_t to_read = 0;
-  if (!http_ensure_cached_range(conn, offset, size, err, &to_read)) {
+  if (offset >= conn->file_size) {
     return 0;
   }
-  if (to_read == 0) {
+  size_t to_read = MIN(size, (size_t)(conn->file_size - offset));
+
+  if (!http_cache_ensure(conn, file, offset, to_read, err)) {
     return 0;
   }
+
+  uint8_t *dst = (uint8_t *) buf;
+  size_t total = 0;
 
   g_mutex_lock(&conn->cache_mutex);
-  if (http_front_window_contains(conn, offset, to_read)) {
-    memcpy(dst, conn->front_window_data + offset, to_read);
-    g_mutex_unlock(&conn->cache_mutex);
-    return to_read;
-  }
-  if (http_tail_window_contains(conn, offset, to_read)) {
-    size_t local_off = (size_t)(offset - conn->tail_window_offset);
-    memcpy(dst, conn->tail_window_data + local_off, to_read);
-    g_mutex_unlock(&conn->cache_mutex);
-    return to_read;
+  while (total < to_read) {
+    const uint8_t *ptr;
+    size_t avail;
+    if (!sparse_cache_view(&conn->cache, offset + total, &ptr, &avail)) {
+      break;
+    }
+    size_t copy = MIN(avail, to_read - total);
+    memcpy(dst + total, ptr, copy);
+    total += copy;
   }
   g_mutex_unlock(&conn->cache_mutex);
 
-  return http_copy_cached_bytes(conn, offset, dst, to_read, err);
+  return total;
 }
 
-/* Zero-copy pointer access */
 bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
                                uint64_t offset,
                                const uint8_t **out_ptr,
@@ -2631,7 +2305,6 @@ bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
   }
 
   HttpConnection *conn = file->conn;
-  const OpenslideHTTPConfig *cfg = _openslide_http_get_config();
 
   if (offset >= conn->file_size) {
     *out_ptr = NULL;
@@ -2639,42 +2312,19 @@ bool _openslide_http_pread_ptr(struct _openslide_http_file *file,
     return true;
   }
 
-  size_t to_read = 0;
-  if (!http_ensure_cached_range(conn, offset, 1, err, &to_read)) {
+  if (!http_cache_ensure(conn, file, offset, 1, err)) {
     return false;
-  }
-  if (to_read == 0) {
-    *out_ptr = NULL;
-    *out_avail = 0;
-    return true;
   }
 
   g_mutex_lock(&conn->cache_mutex);
-  if (http_front_window_view(conn, offset, out_ptr, out_avail)) {
+  if (!sparse_cache_view(&conn->cache, offset, out_ptr, out_avail)) {
     g_mutex_unlock(&conn->cache_mutex);
-    return true;
-  }
-  if (http_tail_window_view(conn, offset, out_ptr, out_avail)) {
-    g_mutex_unlock(&conn->cache_mutex);
+    *out_ptr = NULL;
+    *out_avail = 0;
     return true;
   }
   g_mutex_unlock(&conn->cache_mutex);
 
-  guint64 block_idx = offset / cfg->block_size;
-  uint32_t block_off = offset % cfg->block_size;
-
-  HttpBlock *b = http_get_block(conn, block_idx, err);
-  if (!b || !b->data) {
-    return false;
-  }
-  if (block_off >= b->len) {
-    *out_ptr = NULL;
-    *out_avail = 0;
-    return true;
-  }
-
-  *out_ptr = b->data + block_off;
-  *out_avail = b->len - block_off;
   return true;
 }
 
@@ -2693,10 +2343,10 @@ void _openslide_http_print_stats(void) {
   gint newconn = g_atomic_int_get(&global_stats.new_connections);
 
   fprintf(stderr, "[HTTP-GLOBAL-STATS] requests=%d bytes=%dKB time=%dms avg=%.2fms/req\n",
-          reqs, bytes_kb, time_ms, 
+          reqs, bytes_kb, time_ms,
           reqs > 0 ? (double)time_ms / reqs : 0.0);
   fprintf(stderr, "[HTTP-GLOBAL-STATS] cache_hits=%d cache_misses=%d hit_rate=%.1f%%\n",
-          hits, misses, 
+          hits, misses,
           (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0);
   fprintf(stderr, "[HTTP-GLOBAL-STATS] conn_reused=%d conn_new=%d reuse_rate=%.1f%%\n",
           reused, newconn,
